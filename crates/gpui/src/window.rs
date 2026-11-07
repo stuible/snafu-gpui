@@ -2418,6 +2418,13 @@ impl Window {
             .map(|view| view.clone().downcast::<E>().ok())
     }
 
+    /// The pasteboard of the macOS drag operation whose Submit is being dispatched
+    /// (Snafu). Read it synchronously in that dispatch; `None` at any other time and on
+    /// other platforms.
+    pub fn native_drag_pasteboard(&self) -> Option<crate::MacNativeDragPasteboard> {
+        self.platform_window.native_drag_pasteboard()
+    }
+
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle

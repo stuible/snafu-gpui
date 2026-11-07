@@ -331,6 +331,22 @@ impl Application {
         self
     }
 
+    /// Registers a macOS handler that receives each delivered `NSURL` as an owned
+    /// [`NativeUrl`] before GPUI converts the same delivery to strings (Snafu). Install
+    /// it before [`Application::run`]; it runs synchronously inside
+    /// `application:openURLs:`, receives every delivered URL, and runs before (without
+    /// suppressing) [`Application::on_open_urls`]. Elsewhere it is never called.
+    pub fn on_open_native_urls<F>(&self, callback: F) -> &Self
+    where
+        F: 'static + FnMut(Vec<crate::NativeUrl>),
+    {
+        self.0
+            .borrow()
+            .platform
+            .on_open_native_urls(Box::new(callback));
+        self
+    }
+
     /// Invokes a handler when an already-running application is launched.
     /// On macOS, this can occur when the application icon is double-clicked or the app is launched via the dock.
     pub fn on_reopen<F>(&self, mut callback: F) -> &Self

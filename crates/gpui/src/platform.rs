@@ -1,6 +1,7 @@
 mod app_menu;
 mod keyboard;
 mod keystroke;
+mod native_objects;
 mod platform_info;
 
 #[cfg(all(target_os = "linux", feature = "wayland"))]
@@ -82,6 +83,7 @@ use uuid::Uuid;
 pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
+pub use native_objects::{MacNativeDragPasteboard, NativeObjectOps, NativeUrl};
 
 /// Whether the platform is presenting a window's frames.
 ///
@@ -445,6 +447,10 @@ pub trait Platform: 'static {
 
     fn open_url(&self, url: &str);
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>);
+
+    /// Receive each delivered URL as an owned native object before the string path
+    /// (Snafu; macOS only, ignored elsewhere).
+    fn on_open_native_urls(&self, _callback: Box<dyn FnMut(Vec<NativeUrl>)>) {}
     fn register_url_scheme(&self, url: &str) -> Task<Result<()>>;
 
     fn prompt_for_paths(
@@ -1330,6 +1336,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
+
+    /// The pasteboard of the drag operation whose Submit is being dispatched (Snafu;
+    /// macOS only). `None` outside that dispatch.
+    fn native_drag_pasteboard(&self) -> Option<MacNativeDragPasteboard> {
+        None
+    }
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);

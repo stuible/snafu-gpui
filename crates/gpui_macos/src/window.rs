@@ -58,7 +58,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString, c_void},
     mem,
     ops::Range,
@@ -755,6 +755,8 @@ struct MacWindowState {
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
+    /// Snafu: the drag pasteboard while a `performDragOperation:` Submit is dispatched.
+    native_drag_context: NativeDragContextSlot,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
     // When true, the whole content view is reported as app-owned titlebar content via
@@ -1183,6 +1185,7 @@ impl MacWindow {
                 keystroke_for_do_command: None,
                 do_command_handled: None,
                 external_files_dragged: false,
+                native_drag_context: NativeDragContextSlot::default(),
                 first_mouse: false,
                 app_owns_titlebar_drag,
                 fullscreen_restore_bounds: Bounds::default(),
@@ -2107,6 +2110,13 @@ impl PlatformWindow for MacWindow {
 
     fn on_close(&self, callback: Box<dyn FnOnce()>) {
         self.0.as_ref().lock().close_callback = Some(callback);
+    }
+
+    fn native_drag_pasteboard(&self) -> Option<gpui::MacNativeDragPasteboard> {
+        // Clone the slot first so the window-state lock isn't held while the pasteboard
+        // is retained.
+        let slot = self.0.lock().native_drag_context.clone();
+        slot.get()
     }
 
     fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
@@ -3758,8 +3768,62 @@ extern "C" fn perform_drag_operation(
     dragging_info: *mut AnyObject,
 ) -> Bool {
     let window_state = unsafe { get_window_state(this) };
+    perform_drag_operation_impl(window_state, dragging_info).to_objc()
+}
+
+/// Dispatches Submit with this window's drag pasteboard installed (Snafu). A plain Rust
+/// frame, so the slot guard restores the previous value even if a handler unwinds.
+fn perform_drag_operation_impl(
+    window_state: Arc<Mutex<MacWindowState>>,
+    dragging_info: *mut AnyObject,
+) -> bool {
     let position = drag_event_position(&window_state, dragging_info);
-    send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
+    let context = unsafe { native_drag_pasteboard_from_info(dragging_info) };
+    let slot = window_state.lock().native_drag_context.clone();
+    let _guard = slot.install(context);
+    send_file_drop_event(window_state, FileDropEvent::Submit { position })
+}
+
+/// Retains the drag operation's pasteboard for the Submit dispatch. A retain conveys
+/// memory ownership only, not stable contents or continuing permission to read.
+unsafe fn native_drag_pasteboard_from_info(
+    dragging_info: *mut AnyObject,
+) -> Option<gpui::MacNativeDragPasteboard> {
+    let pasteboard: *mut AnyObject = unsafe { msg_send![dragging_info, draggingPasteboard] };
+    (!pasteboard.is_null()).then(|| unsafe {
+        gpui::MacNativeDragPasteboard::retain(pasteboard.cast(), crate::OBJC_OBJECT_OPS)
+    })
+}
+
+/// The per-window drag pasteboard during a Submit dispatch (Snafu). Installing saves
+/// the previous value and the guard restores it, so a nested dispatch sees only its own
+/// context and nothing stale outlives a dispatch, whether it completed or unwound.
+#[derive(Clone, Default)]
+struct NativeDragContextSlot(Rc<RefCell<Option<gpui::MacNativeDragPasteboard>>>);
+
+impl NativeDragContextSlot {
+    fn get(&self) -> Option<gpui::MacNativeDragPasteboard> {
+        self.0.borrow().clone()
+    }
+
+    fn install(&self, context: Option<gpui::MacNativeDragPasteboard>) -> NativeDragContextGuard {
+        let previous = self.0.replace(context);
+        NativeDragContextGuard {
+            slot: self.0.clone(),
+            previous,
+        }
+    }
+}
+
+struct NativeDragContextGuard {
+    slot: Rc<RefCell<Option<gpui::MacNativeDragPasteboard>>>,
+    previous: Option<gpui::MacNativeDragPasteboard>,
+}
+
+impl Drop for NativeDragContextGuard {
+    fn drop(&mut self) {
+        *self.slot.borrow_mut() = self.previous.take();
+    }
 }
 
 fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPaths> {

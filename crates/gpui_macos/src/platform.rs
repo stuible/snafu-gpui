@@ -187,6 +187,8 @@ pub(crate) struct MacPlatformState {
     will_open_menu: Option<Box<dyn FnMut()>>,
     menu_actions: Vec<Box<dyn Action>>,
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
+    /// Snafu: the owned-NSURL handler that runs before `open_urls`.
+    on_open_native_urls: Option<Box<dyn FnMut(Vec<gpui::NativeUrl>)>>,
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<Retained<NSMenu>>,
     menus: Option<Vec<OwnedMenu>>,
@@ -250,6 +252,7 @@ impl MacPlatform {
             will_open_menu: None,
             menu_actions: Default::default(),
             open_urls: None,
+            on_open_native_urls: None,
             finish_launching: None,
             dock_menu: None,
             on_keyboard_layout_change: None,
@@ -859,6 +862,10 @@ impl Platform for MacPlatform {
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
         self.0.lock().open_urls = Some(callback);
+    }
+
+    fn on_open_native_urls(&self, callback: Box<dyn FnMut(Vec<gpui::NativeUrl>)>) {
+        self.0.lock().on_open_native_urls = Some(callback);
     }
 
     fn prompt_for_paths(
@@ -1490,6 +1497,33 @@ extern "C-unwind" fn on_system_wake(this: &AnyObject, _: Sel, _: *mut AnyObject)
 }
 
 extern "C-unwind" fn open_urls(this: &AnyObject, _: Sel, _: *mut AnyObject, urls: *mut AnyObject) {
+    // Snafu: hand each NSURL over as an owned object first. The slot is taken so the
+    // callback runs without the platform lock held, then restored.
+    let platform = unsafe { get_mac_platform(this) };
+    let native_callback = platform.0.lock().on_open_native_urls.take();
+    if let Some(mut callback) = native_callback {
+        // SAFETY: AppKit keeps `urls` alive for this call; each wrapper takes its own +1
+        // retain, valid after the callback returns and released once when dropped.
+        let native_urls = unsafe {
+            urls.cast::<NSArray<NSURL>>()
+                .as_ref()
+                .into_iter()
+                .flat_map(|urls| urls.iter())
+                .map(|url| {
+                    gpui::NativeUrl::retain(
+                        Retained::as_ptr(&url).cast_mut().cast(),
+                        crate::OBJC_OBJECT_OPS,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        callback(native_urls);
+        platform
+            .0
+            .lock()
+            .on_open_native_urls
+            .get_or_insert(callback);
+    }
     let urls = unsafe {
         urls.cast::<NSArray<NSURL>>()
             .as_ref()

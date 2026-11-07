@@ -124,3 +124,20 @@ unsafe impl RefEncode for NSRange {
 fn ns_string(string: &str) -> *mut AnyObject {
     Retained::autorelease_ptr(NSString::from_str(string)).cast()
 }
+
+/// Objective-C retain/release for the owned native objects GPUI hands the app (Snafu).
+pub(crate) const OBJC_OBJECT_OPS: gpui::NativeObjectOps = gpui::NativeObjectOps {
+    retain: objc_retain,
+    release: objc_release,
+};
+
+unsafe fn objc_retain(object: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    let object = object.cast::<objc2::runtime::AnyObject>();
+    let retained: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![object, retain] };
+    retained.cast()
+}
+
+unsafe fn objc_release(object: *mut std::ffi::c_void) {
+    let object = object.cast::<objc2::runtime::AnyObject>();
+    let _: () = unsafe { objc2::msg_send![object, release] };
+}
