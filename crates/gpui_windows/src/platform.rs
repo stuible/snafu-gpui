@@ -93,6 +93,9 @@ pub(crate) struct WindowsPlatformState {
     jump_list: RefCell<JumpList>,
     // NOTE: standard cursor handles don't need to close.
     pub(crate) current_cursor: Cell<Option<HCURSOR>>,
+    /// The native image cursor shown now (Snafu): its identity and owned handle,
+    /// destroyed once replaced.
+    custom_cursor: Cell<Option<(u64, HCURSOR)>>,
     /// Shared with each window so `WM_SETCURSOR` can read it directly.
     pub(crate) cursor_visible: Arc<AtomicBool>,
     /// Shared with each window to coordinate draws across windows on the UI
@@ -127,6 +130,7 @@ impl WindowsPlatformState {
             callbacks,
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
+            custom_cursor: Cell::new(None),
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
@@ -539,6 +543,29 @@ fn encode_restart_arguments(arguments: &[OsString]) -> OsString {
     }
 
     OsString::from_wide(&encoded)
+}
+
+impl WindowsPlatform {
+    fn show_cursor(&self, hcursor: Option<HCURSOR>) {
+        if self.inner.state.current_cursor.get().map(|c| c.0) != hcursor.map(|c| c.0) {
+            self.post_message(
+                WM_GPUI_CURSOR_STYLE_CHANGED,
+                WPARAM(self.inner.validation_number),
+                LPARAM(hcursor.map_or(0, |c| c.0 as isize)),
+            );
+            self.inner.state.current_cursor.set(hcursor);
+        }
+    }
+
+    /// Record the custom cursor now shown (Snafu), destroying the one it replaces. The
+    /// windows have already been told to switch, so the old handle is no longer current.
+    fn replace_custom_cursor(&self, cursor: Option<(u64, HCURSOR)>) {
+        if let Some((_, old)) = self.inner.state.custom_cursor.replace(cursor) {
+            if cursor.is_none_or(|(_, new)| new.0 != old.0) {
+                unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyCursor(old) }.log_err();
+            }
+        }
+    }
 }
 
 impl Platform for WindowsPlatform {
@@ -1008,14 +1035,29 @@ impl Platform for WindowsPlatform {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        let hcursor = load_cursor(style);
-        if self.inner.state.current_cursor.get().map(|c| c.0) != hcursor.map(|c| c.0) {
-            self.post_message(
-                WM_GPUI_CURSOR_STYLE_CHANGED,
-                WPARAM(self.inner.validation_number),
-                LPARAM(hcursor.map_or(0, |c| c.0 as isize)),
-            );
-            self.inner.state.current_cursor.set(hcursor);
+        self.show_cursor(load_cursor(style));
+        self.replace_custom_cursor(None);
+    }
+
+    fn set_custom_cursor(&self, cursor: &gpui::CustomCursor) {
+        if self
+            .inner
+            .state
+            .custom_cursor
+            .get()
+            .is_some_and(|(id, _)| id == cursor.id())
+        {
+            return;
+        }
+        match crate::custom_cursor::create_custom_cursor(cursor) {
+            Ok(native) => {
+                self.show_cursor(Some(native));
+                self.replace_custom_cursor(Some((cursor.id(), native)));
+            }
+            Err(error) => {
+                log::error!("Creating native image cursor failed: {error:#}");
+                self.set_cursor_style(CursorStyle::Arrow);
+            }
         }
     }
 

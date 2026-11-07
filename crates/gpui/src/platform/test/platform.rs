@@ -37,6 +37,8 @@ pub(crate) struct TestPlatform {
     displays: RefCell<Vec<TestDisplay>>,
     displays_changed_callback: RefCell<Option<Box<dyn FnMut()>>>,
     active_cursor: Mutex<CursorStyle>,
+    /// The custom cursor last shown (Snafu), for platform-independent UI tests.
+    active_custom_cursor: Mutex<Option<u64>>,
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     current_primary_item: Mutex<Option<ClipboardItem>>,
@@ -126,6 +128,11 @@ pub(crate) struct TestPrompts {
 }
 
 impl TestPlatform {
+    /// The custom cursor last shown (Snafu).
+    pub(crate) fn active_custom_cursor_id(&self) -> Option<u64> {
+        *self.active_custom_cursor.lock()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(executor: BackgroundExecutor, foreground_executor: ForegroundExecutor) -> Rc<Self> {
         Self::with_platform(
@@ -238,6 +245,7 @@ impl TestPlatform {
             prompts: Default::default(),
             screen_capture_sources: Default::default(),
             active_cursor: Default::default(),
+            active_custom_cursor: Default::default(),
             displays: RefCell::new(vec![TestDisplay::new()]),
             displays_changed_callback: Default::default(),
             active_window: Default::default(),
@@ -770,6 +778,12 @@ impl Platform for TestPlatform {
 
     fn set_cursor_style(&self, style: crate::CursorStyle) {
         *self.active_cursor.lock() = style;
+        *self.active_custom_cursor.lock() = None;
+    }
+
+    fn set_custom_cursor(&self, cursor: &crate::CustomCursor) {
+        *self.active_cursor.lock() = CursorStyle::Arrow;
+        *self.active_custom_cursor.lock() = Some(cursor.id());
     }
 
     fn hide_cursor_until_mouse_moves(&self) {}

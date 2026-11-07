@@ -1186,6 +1186,13 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn set_custom_cursor(&self, cursor: &gpui::CustomCursor) {
+        // SAFETY: platform calls run on the AppKit main thread.
+        unsafe {
+            crate::window::set_active_window_custom_cursor(cursor);
+        }
+    }
+
     fn hide_cursor_until_mouse_moves(&self) {
         let cursor_visible = self.0.lock().cursor_visible.clone();
         if !cursor_visible.swap(false, Ordering::Relaxed) {

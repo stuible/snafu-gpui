@@ -8,7 +8,8 @@ use anyhow::Result;
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, CustomCursor,
+    ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
@@ -376,6 +377,77 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
 /// This function is not thread safe. Callers must ensure this is called on the AppKit main
 /// thread because it reads the active AppKit window and updates GPUI window state associated
 /// with Objective-C objects.
+/// The GPUI window that owns the pointer: the key window, else the main window.
+///
+/// # Safety
+/// The caller guarantees AppKit main-thread access.
+unsafe fn active_gpui_window() -> Option<*mut AnyObject> {
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let key_window: *mut AnyObject = msg_send![app, keyWindow];
+        let main_window: *mut AnyObject = msg_send![app, mainWindow];
+        if !key_window.is_null() && is_gpui_window(key_window) {
+            Some(key_window)
+        } else if !main_window.is_null() && is_gpui_window(main_window) {
+            Some(main_window)
+        } else {
+            None
+        }
+    }
+}
+
+/// Show a native image cursor in the active window (Snafu). An unchanged cursor is not
+/// rebuilt; an undecodable image falls back to the arrow.
+pub(crate) unsafe fn set_active_window_custom_cursor(cursor: &CustomCursor) {
+    // SAFETY: The caller guarantees AppKit main-thread access; `active_gpui_window` only
+    // returns windows carrying our WINDOW_STATE_IVAR. The NSCursor is retained once here
+    // and released when replaced.
+    unsafe {
+        let Some(active_window) = active_gpui_window() else {
+            return;
+        };
+        let window_state = get_window_state(&*active_window);
+        let mut window_state = window_state.lock();
+        if window_state.custom_cursor.map(|(id, _)| id) == Some(cursor.id()) {
+            return;
+        }
+        let png = cursor.png_data();
+        let data: *mut AnyObject =
+            msg_send![class!(NSData), dataWithBytes: png.as_ptr().cast::<c_void>(), length: png.len()];
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: data];
+        let native_cursor = if image.is_null() {
+            None
+        } else {
+            let logical = cursor.size();
+            let _: () = msg_send![image, setSize: NSSize::new(
+                f64::from(f32::from(logical.width)),
+                f64::from(f32::from(logical.height)),
+            )];
+            let hotspot = cursor.hotspot();
+            let hotspot = NSPoint::new(
+                f64::from(f32::from(hotspot.x)),
+                f64::from(f32::from(hotspot.y)),
+            );
+            let allocated: *mut AnyObject = msg_send![class!(NSCursor), alloc];
+            let native: *mut AnyObject = msg_send![allocated, initWithImage: image, hotSpot: hotspot];
+            let _: () = msg_send![image, release];
+            (!native.is_null()).then_some(native)
+        };
+        if let Some((_, old)) = window_state.custom_cursor.take() {
+            let _: () = msg_send![old, release];
+        }
+        match native_cursor {
+            Some(native) => window_state.custom_cursor = Some((cursor.id(), native)),
+            None => window_state.cursor_style = CursorStyle::Arrow,
+        }
+        let _: () = msg_send![
+            window_state.native_window,
+            invalidateCursorRectsForView: window_state.native_view.as_ptr()
+        ];
+    }
+}
+
 pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
     // SAFETY: The caller guarantees AppKit main-thread access. `is_gpui_window` ensures the
     // window has our WINDOW_STATE_IVAR before reading it.
@@ -397,7 +469,13 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
 
         let window_state = get_window_state(&*active_window);
         let mut window_state = window_state.lock();
-        if window_state.cursor_style != style {
+        let had_custom = if let Some((_, old)) = window_state.custom_cursor.take() {
+            let _: () = msg_send![old, release];
+            true
+        } else {
+            false
+        };
+        if window_state.cursor_style != style || had_custom {
             window_state.cursor_style = style;
             let _: () = msg_send![
                 window_state.native_window,
@@ -646,6 +724,9 @@ struct MacWindowState {
     blurred_view: Option<*mut AnyObject>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
+    /// A native image cursor shown instead of `cursor_style` (Snafu): its identity and
+    /// a +1-retained NSCursor, released when replaced.
+    custom_cursor: Option<(u64, *mut AnyObject)>,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
@@ -1071,6 +1152,7 @@ impl MacWindow {
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
+                custom_cursor: None,
                 cursor_visible,
                 frame_source: None,
                 renderer,
@@ -2503,9 +2585,18 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
         let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
 
         let window_state = get_window_state(this);
-        let cursor_style = window_state.lock().cursor_style;
+        let (cursor_style, custom_cursor) = {
+            let state = window_state.lock();
+            (state.cursor_style, state.custom_cursor.map(|(_, cursor)| cursor))
+        };
+        if let Some(cursor) = custom_cursor {
+            let bounds: NSRect = msg_send![this, bounds];
+            let _: () = msg_send![this, addCursorRect: bounds, cursor: cursor];
+            return;
+        }
 
         let cursor: *mut AnyObject = match cursor_style {
+            CursorStyle::None => transparent_cursor(),
             CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
             CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
             CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
@@ -2544,6 +2635,24 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
         let bounds: NSRect = msg_send![this, bounds];
         let _: () = msg_send![this, addCursorRect: bounds, cursor: cursor];
     }
+}
+
+/// A shared fully transparent cursor for `CursorStyle::None` (Snafu): hiding through the
+/// cursor rect keeps AppKit's cursor stack balanced, unlike NSCursor hide/unhide.
+///
+/// # Safety
+/// The caller guarantees AppKit main-thread access.
+unsafe fn transparent_cursor() -> *mut AnyObject {
+    static CURSOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CURSOR.get_or_init(|| unsafe {
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(16., 16.)];
+        let allocated: *mut AnyObject = msg_send![class!(NSCursor), alloc];
+        let cursor: *mut AnyObject =
+            msg_send![allocated, initWithImage: image, hotSpot: NSPoint::new(0., 0.)];
+        let _: () = msg_send![image, release];
+        cursor as usize
+    }) as *mut AnyObject
 }
 
 extern "C" fn handle_key_equivalent(

@@ -1386,6 +1386,8 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        // Snafu: no hidden-pointer cursor theme name; show the arrow.
+        CursorStyle::None => &[DEFAULT_CURSOR_ICON_NAME],
     }
 }
 

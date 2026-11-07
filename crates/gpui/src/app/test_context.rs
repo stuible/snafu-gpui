@@ -436,6 +436,11 @@ impl TestAppContext {
         self.test_platform.opened_url.borrow().clone()
     }
 
+    /// The custom cursor last shown on the test platform, if any (Snafu).
+    pub fn active_custom_cursor_id(&self) -> Option<u64> {
+        self.test_platform.active_custom_cursor_id()
+    }
+
     /// Returns the application identity configured during this test.
     pub fn app_identity(&self) -> Option<(SharedString, SharedString)> {
         self.test_platform.app_identity()

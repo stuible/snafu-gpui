@@ -739,6 +739,8 @@ pub(crate) type AnyMouseListener =
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
     pub(crate) style: CursorStyle,
+    /// A native image cursor shown instead of `style` (Snafu).
+    pub(crate) custom: Option<crate::CustomCursor>,
 }
 
 #[derive(Default, Eq, PartialEq)]
@@ -1148,16 +1150,16 @@ impl Frame {
         }
     }
 
-    pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
+    pub(crate) fn cursor_request(&self, window: &Window) -> Option<CursorStyleRequest> {
         self.cursor_styles
             .iter()
             .rev()
-            .fold_while(None, |style, request| match request.hitbox_id {
-                None => Done(Some(request.style)),
-                Some(hitbox_id) => Continue(style.or_else(|| {
+            .fold_while(None, |selected, request| match request.hitbox_id {
+                None => Done(Some(request.clone())),
+                Some(hitbox_id) => Continue(selected.or_else(|| {
                     hitbox_id
                         .is_hovered_ignoring_last_input(window)
-                        .then_some(request.style)
+                        .then(|| request.clone())
                 })),
             })
             .into_inner()
@@ -4175,6 +4177,18 @@ impl Window {
         self.next_frame.cursor_styles.push(CursorStyleRequest {
             hitbox_id: Some(hitbox.id),
             style,
+            custom: None,
+        });
+    }
+
+    /// Show a native image cursor while the given hitbox is hovered (Snafu). The
+    /// hotspot follows the OS pointer, so pointer moves need no new frame.
+    pub fn set_custom_cursor(&mut self, cursor: crate::CustomCursor, hitbox: &Hitbox) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.cursor_styles.push(CursorStyleRequest {
+            hitbox_id: Some(hitbox.id),
+            style: CursorStyle::Arrow,
+            custom: Some(cursor),
         });
     }
 
@@ -4187,6 +4201,7 @@ impl Window {
         self.next_frame.cursor_styles.push(CursorStyleRequest {
             hitbox_id: None,
             style,
+            custom: None,
         })
     }
 
@@ -5606,11 +5621,14 @@ impl Window {
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = self
-                .rendered_frame
-                .cursor_style(self)
-                .unwrap_or(CursorStyle::Arrow);
-            cx.platform.set_cursor_style(style);
+            match self.rendered_frame.cursor_request(self) {
+                Some(CursorStyleRequest {
+                    custom: Some(cursor),
+                    ..
+                }) => cx.platform.set_custom_cursor(&cursor),
+                Some(request) => cx.platform.set_cursor_style(request.style),
+                None => cx.platform.set_cursor_style(CursorStyle::Arrow),
+            }
         }
     }
 

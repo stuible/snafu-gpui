@@ -38,5 +38,7 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
+        // Snafu: Wayland has no shape for a hidden pointer here; show the arrow.
+        CursorStyle::None => Shape::Default,
     }
 }

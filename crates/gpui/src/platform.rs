@@ -575,6 +575,12 @@ pub trait Platform: 'static {
 
     fn set_cursor_style(&self, style: CursorStyle);
 
+    /// Show a native image cursor (Snafu). Platforms without custom cursors show
+    /// the arrow.
+    fn set_custom_cursor(&self, _cursor: &CustomCursor) {
+        self.set_cursor_style(CursorStyle::Arrow);
+    }
+
     /// Hides the mouse cursor until the user moves the mouse over one of
     /// this application's windows.
     fn hide_cursor_until_mouse_moves(&self);
@@ -3079,6 +3085,59 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// No visible pointer (Snafu): the app draws its own cursor, such as a brush ring,
+    /// while the pointer is over the given area. Platforms without a way to hide the
+    /// pointer show the arrow.
+    None,
+}
+
+/// A PNG-backed native image cursor (Snafu), for platforms with custom cursors.
+#[derive(Clone, Debug)]
+pub struct CustomCursor {
+    png_data: Arc<[u8]>,
+    size: Size<Pixels>,
+    hotspot: Point<Pixels>,
+    id: u64,
+}
+
+impl CustomCursor {
+    /// Build a cursor from PNG data and its logical-pixel size and hotspot.
+    pub fn new(png_data: Arc<[u8]>, size: Size<Pixels>, hotspot: Point<Pixels>) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        png_data.hash(&mut hasher);
+        f32::from(size.width).to_bits().hash(&mut hasher);
+        f32::from(size.height).to_bits().hash(&mut hasher);
+        f32::from(hotspot.x).to_bits().hash(&mut hasher);
+        f32::from(hotspot.y).to_bits().hash(&mut hasher);
+        Self {
+            png_data,
+            size,
+            hotspot,
+            id: hasher.finish(),
+        }
+    }
+
+    /// The PNG-encoded cursor image.
+    pub fn png_data(&self) -> &[u8] {
+        &self.png_data
+    }
+
+    /// The cursor image's size in logical pixels.
+    pub fn size(&self) -> Size<Pixels> {
+        self.size
+    }
+
+    /// The image-space point that tracks the pointer.
+    pub fn hotspot(&self) -> Point<Pixels> {
+        self.hotspot
+    }
+
+    /// A stable identity for the image, size and hotspot, so platforms can skip
+    /// rebuilding an unchanged cursor.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// A clipboard item that should be copied to the clipboard
