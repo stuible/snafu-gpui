@@ -760,6 +760,10 @@ pub enum WindowControlArea {
     Max,
     /// An area that allows minimizing of the platform window.
     Min,
+    /// A client surface that must keep routing input to the app even where a native
+    /// caption would otherwise claim it, such as a full-height rail beside an extended
+    /// title bar (Snafu). It carries no window-action semantics.
+    Passthrough,
 }
 
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
@@ -1081,6 +1085,7 @@ pub(crate) struct PaintIndex {
     input_handlers_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
+    window_control_hitboxes_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
 }
@@ -1165,6 +1170,25 @@ impl Frame {
             .into_inner()
     }
 
+    /// The window control area eligible for mouse interaction at `point` (Snafu): hitboxes
+    /// front to back up to the hover cutoff `hit_test` applies for masks, `BlockMouse` and
+    /// `BlockMouseExceptScroll`, so scroll-only hitboxes never become window-control
+    /// targets; the topmost eligible control wins. A pure lookup with no events or hover
+    /// changes; `None` before the first completed frame.
+    pub(crate) fn window_control_at(&self, point: Point<Pixels>) -> Option<WindowControlArea> {
+        let hit_test = self.hit_test(point);
+        hit_test
+            .ids
+            .iter()
+            .take(hit_test.hover_hitbox_count)
+            .find_map(|id| {
+                self.window_control_hitboxes
+                    .iter()
+                    .find(|(_, hitbox)| hitbox.id == *id)
+                    .map(|(area, _)| *area)
+            })
+    }
+
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
@@ -1229,6 +1253,14 @@ pub struct Window {
     text_system: Rc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
+    /// Monotonic count of published control layouts (Snafu), so a consumer can tell
+    /// frames apart.
+    #[cfg(any(target_os = "windows", test))]
+    frame_count: u64,
+    /// Whether a control layout was ever published (Snafu): empty frames publish once,
+    /// to clear stale native regions, then stay silent.
+    #[cfg(any(target_os = "windows", test))]
+    published_control_layout: bool,
     /// The stack of override values for the window's rem size.
     ///
     /// This is used by `with_rem_size` to allow rendering an element tree with
@@ -2112,18 +2144,23 @@ impl Window {
         });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
-            Box::new(move || {
+            Box::new(move |point| {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
-                        }
-                        None
+                        window.rendered_frame.window_control_at(point)
                     })
                     .log_err()
                     .unwrap_or(None)
+            })
+        });
+        // Snafu: a changed native caption snapshot must dirty this window's cached views;
+        // the platform invokes this outside every SDK call and borrow.
+        platform_window.on_caption_chrome_changed({
+            let mut cx = cx.to_async();
+            Box::new(move || {
+                handle
+                    .update(&mut cx, |_, window, _cx| window.refresh())
+                    .log_err();
             })
         });
         platform_window.on_move_tab_to_new_window({
@@ -2212,6 +2249,10 @@ impl Window {
             focused_text_input: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            #[cfg(any(target_os = "windows", test))]
+            frame_count: 0,
+            #[cfg(any(target_os = "windows", test))]
+            published_control_layout: false,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2528,6 +2569,13 @@ impl Window {
             style.refine(refinement);
         }
         style
+    }
+
+    /// This window's native AppWindow caption snapshot (Snafu): whether the Windows native
+    /// caption is attached to this window, and its measured title-bar geometry. The
+    /// inactive default on every other platform; there is no any-window query.
+    pub fn app_window_caption_state(&self) -> crate::CaptionChromeState {
+        self.platform_window.app_window_caption_state()
     }
 
     /// Check if the platform window is maximized.
@@ -3472,6 +3520,63 @@ impl Window {
         self.capslock
     }
 
+    /// Publishes the just-completed frame's window-control geometry to the platform
+    /// (Snafu): every Drag and Passthrough rectangle clipped by its content mask, with any
+    /// Drag rectangle a later mouse-blocking hitbox covers suppressed whole. Plain data
+    /// only; native work happens on the platform's own queue, never inside a draw.
+    #[cfg(any(target_os = "windows", test))]
+    fn publish_completed_control_layout(&mut self) {
+        use crate::window_caption_geometry::{
+            OrderedDragRect, OrderedHitbox, suppress_covered_drag_rects,
+        };
+        let hitboxes: Vec<OrderedHitbox> = self
+            .rendered_frame
+            .hitboxes
+            .iter()
+            .map(|hitbox| OrderedHitbox {
+                clipped: hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                blocks_mouse: matches!(
+                    hitbox.behavior,
+                    HitboxBehavior::BlockMouse | HitboxBehavior::BlockMouseExceptScroll
+                ),
+            })
+            .collect();
+        let mut drags = Vec::new();
+        let mut passthrough = Vec::new();
+        for (area, hitbox) in &self.rendered_frame.window_control_hitboxes {
+            let order = self
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .position(|inserted| inserted.id == hitbox.id);
+            let clipped = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+            match (area, order) {
+                (WindowControlArea::Drag, Some(order)) => drags.push(OrderedDragRect {
+                    rect: clipped,
+                    order,
+                }),
+                (WindowControlArea::Passthrough, _) => passthrough.push(clipped),
+                // Close/Max/Min are the native controls' own kinds.
+                _ => {}
+            }
+        }
+        if drags.is_empty() && passthrough.is_empty() && !self.published_control_layout {
+            return;
+        }
+        self.frame_count += 1;
+        self.published_control_layout = true;
+        let drag = suppress_covered_drag_rects(&drags, &hitboxes);
+        self.platform_window
+            .publish_window_control_layout(crate::WindowControlLayout {
+                drag,
+                passthrough,
+                frame: self.frame_count,
+                client_size: self.viewport_size,
+                scale_factor: self.scale_factor,
+                ..Default::default()
+            });
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
@@ -3567,6 +3672,8 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        #[cfg(any(target_os = "windows", test))]
+        self.publish_completed_control_layout();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -4108,6 +4215,7 @@ impl Window {
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
         }
@@ -4145,6 +4253,14 @@ impl Window {
                 ..range.end.accessed_element_states_index]
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
+        );
+        // Snafu: cached paint replays its window-control areas too, so a reused view
+        // keeps its caption geometry.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
+                .iter()
+                .cloned(),
         );
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history

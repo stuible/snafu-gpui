@@ -436,6 +436,18 @@ impl TestAppContext {
         self.test_platform.opened_url.borrow().clone()
     }
 
+    /// Simulates a native window-control hit-test query at `point`, in client logical
+    /// pixels (Snafu). It resolves against the most recently completed frame and
+    /// dispatches no input, so mouse position and hover state are untouched.
+    pub fn simulate_window_control_hit_test(
+        &mut self,
+        window: AnyWindowHandle,
+        point: Point<Pixels>,
+    ) -> Option<crate::WindowControlArea> {
+        self.test_window(window)
+            .simulate_window_control_hit_test(point)
+    }
+
     /// The custom cursor last shown on the test platform, if any (Snafu).
     pub fn active_custom_cursor_id(&self) -> Option<u64> {
         self.test_platform.active_custom_cursor_id()
@@ -878,7 +890,59 @@ pub struct VisualTestContext {
     window: AnyWindowHandle,
 }
 
+/// The test-side record of one completed frame's published window-control geometry
+/// (Snafu): the public mirror of the internal payload, without the identity and
+/// metric-revision fields the real platform stamps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublishedWindowControlLayout {
+    /// Caption drag rectangles, clipped by content masks, with covered drags removed.
+    pub drag: Vec<Bounds<Pixels>>,
+    /// Passthrough rectangles (client-routing areas such as a full-height rail).
+    pub passthrough: Vec<Bounds<Pixels>>,
+    /// The window's monotonic publication counter at this frame.
+    pub frame: u64,
+    /// The logical client extent the layout was computed under.
+    pub client_size: Size<Pixels>,
+    /// The scale factor the layout was computed under.
+    pub scale_factor: f32,
+}
+
 impl VisualTestContext {
+    /// Simulates a native window-control hit-test query at `point` in this window
+    /// (Snafu); see [`TestAppContext::simulate_window_control_hit_test`].
+    pub fn simulate_window_control_hit_test(
+        &mut self,
+        point: Point<Pixels>,
+    ) -> Option<crate::WindowControlArea> {
+        self.cx.simulate_window_control_hit_test(self.window, point)
+    }
+
+    /// Replaces this window's caption snapshot as the real platform does on attach,
+    /// detach or metric updates (Snafu); a changed snapshot dirties the window.
+    pub fn set_caption_chrome_state(&mut self, state: crate::CaptionChromeState) {
+        self.cx
+            .test_window(self.window)
+            .set_caption_chrome_state(state)
+    }
+
+    /// The window-control layouts this window published, oldest first (Snafu): the
+    /// drag and passthrough rectangles a real platform would queue for native regions.
+    #[cfg(any(target_os = "windows", test))]
+    pub fn published_window_control_layouts(&self) -> Vec<PublishedWindowControlLayout> {
+        self.cx
+            .test_window(self.window)
+            .published_window_control_layouts()
+            .into_iter()
+            .map(|layout| PublishedWindowControlLayout {
+                drag: layout.drag,
+                passthrough: layout.passthrough,
+                frame: layout.frame,
+                client_size: layout.client_size,
+                scale_factor: layout.scale_factor,
+            })
+            .collect()
+    }
+
     /// Provides a `Window` and `App` for the duration of the closure.
     pub fn update<R>(&mut self, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
         self.cx

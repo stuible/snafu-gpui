@@ -85,6 +85,53 @@ pub use keyboard::*;
 pub use keystroke::*;
 pub use native_objects::{MacNativeDragPasteboard, NativeObjectOps, NativeUrl};
 
+/// Copyable per-window snapshot of the Windows AppWindow caption (Snafu), on by default
+/// (`SNAFU_DISABLE_NATIVE_CAPTION=1` opts out). There is no any-window global flag: UI
+/// reads its own window's state through [`Window::app_window_caption_state`]. Elsewhere
+/// the inactive default is the only value.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaptionChromeState {
+    /// Whether the native caption is attached to this window; failure and detach reset
+    /// it, restoring the app's own controls.
+    pub active: bool,
+    /// The SDK title bar's measured height in logical pixels, if attached.
+    pub caption_height: Option<Pixels>,
+    /// The SDK title bar's left inset in logical pixels, if attached.
+    pub left_inset: Option<Pixels>,
+    /// The SDK title bar's right inset in logical pixels, if attached.
+    pub right_inset: Option<Pixels>,
+}
+
+/// App-authored window-control geometry from one completed frame, plain data only
+/// (Snafu). The window publishes it after the rendered-frame swap; the Windows platform
+/// turns the Drag and Passthrough rectangles into native non-client regions.
+/// Coordinates are logical client pixels already clipped by each control's content mask,
+/// with drag rectangles covered by a later mouse-blocking hitbox removed whole.
+///
+/// `identity` and `metric_revision` are left 0 by the publisher: the platform stamps
+/// its own native-lifetime identity and metric revision on receipt and rejects stored
+/// payloads that no longer match. The rest describe the frame the geometry was measured
+/// under, so a consumer can reject a payload that predates a resize or DPI change.
+#[cfg(any(target_os = "windows", test))]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WindowControlLayout {
+    /// Drag (caption) rectangles.
+    pub drag: Vec<Bounds<Pixels>>,
+    /// Areas that must route as client input (for example a full-height rail).
+    pub passthrough: Vec<Bounds<Pixels>>,
+    /// The platform's native-lifetime identity; stamped by the platform.
+    pub identity: u64,
+    /// Monotonic per-window frame counter at publication time.
+    pub frame: u64,
+    /// The logical client extent the layout was computed under.
+    pub client_size: Size<Pixels>,
+    /// The scale factor the layout was computed under.
+    pub scale_factor: f32,
+    /// The platform's metric revision; stamped by the platform.
+    pub metric_revision: u64,
+}
+
 /// Whether the platform is presenting a window's frames.
 ///
 /// This is about presentation, not the window's shown/hidden state: a shown
@@ -1334,7 +1381,30 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// outside of any window update.
     fn on_display_changed(&self, callback: Box<dyn FnMut()>);
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
+    /// Registers a callback that classifies a client-space position as a window control
+    /// area (Snafu: the position is passed in). It receives the position being classified,
+    /// in client logical pixels, and resolves it against the most recently completed frame;
+    /// it must not depend on or establish any prior mouse-move or hover delivery.
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
+    );
+    /// Registers a callback invoked when this window's native caption chrome state changes
+    /// outside a GPUI frame (Snafu: the Windows caption's attach, detach and metric
+    /// updates). It must mark the window dirty. The platform invokes it outside every SDK
+    /// call and GPUI borrow, once per changed snapshot. Platforms without the native
+    /// caption never store or invoke it.
+    fn on_caption_chrome_changed(&self, _callback: Box<dyn FnMut()>) {}
+    /// Publishes the completed-frame window-control layout (Snafu; see
+    /// [`WindowControlLayout`]). Implementations only queue the plain payload; drawing
+    /// never calls into the SDK.
+    #[cfg(any(target_os = "windows", test))]
+    fn publish_window_control_layout(&self, _layout: WindowControlLayout) {}
+    /// This window's native AppWindow caption snapshot (Snafu). Platforms without the
+    /// Windows native caption return the inactive default.
+    fn app_window_caption_state(&self) -> CaptionChromeState {
+        CaptionChromeState::default()
+    }
     fn on_close(&self, callback: Box<dyn FnOnce()>);
 
     /// The pasteboard of the drag operation whose Submit is being dispatched (Snafu;

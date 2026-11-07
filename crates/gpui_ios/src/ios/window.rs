@@ -275,7 +275,7 @@ pub(crate) struct IosWindowState {
     /// Callback for should close
     should_close_callback: CallbackSlot<Box<dyn FnMut() -> bool>>,
     /// Callback for hit test
-    hit_test_callback: CallbackSlot<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+    hit_test_callback: CallbackSlot<Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>>,
     /// Callback for close
     close_callback: CallbackSlot<Box<dyn FnOnce()>>,
     /// Callback for appearance changes
@@ -992,7 +992,10 @@ impl PlatformWindow for IosWindow {
         self.should_close_callback.set(callback);
     }
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.hit_test_callback.set(callback);
     }
 

@@ -59,6 +59,11 @@ mod text_system;
 mod util;
 mod view;
 mod window;
+/// SDK-free Windows caption geometry rules (Snafu), shared by the frame publisher and
+/// the Windows caption host; compiled on Windows and in tests.
+#[cfg(any(target_os = "windows", test))]
+#[doc(hidden)]
+pub mod window_caption_geometry;
 
 #[cfg(feature = "profiler")]
 mod debug_overlay;

@@ -6,6 +6,9 @@ use crate::{
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
     WindowVisibility,
 };
+use crate::CaptionChromeState;
+#[cfg(any(target_os = "windows", test))]
+use crate::WindowControlLayout;
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -31,7 +34,17 @@ pub(crate) struct TestWindowState {
     renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     close_callback: Option<Box<dyn FnOnce()>>,
-    hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+    hit_test_window_control_callback:
+        Option<Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>>,
+    /// Snafu: whether simulated pointer input is inside the window.
+    hovered: bool,
+    caption_chrome_changed_callback: Option<Box<dyn FnMut()>>,
+    /// Snafu: the caption snapshot the platform reports; tests install one to exercise
+    /// the measured native-header layout.
+    pub(crate) caption_state: CaptionChromeState,
+    /// Snafu: every control layout the window published, in order.
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) published_layouts: Vec<WindowControlLayout>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     visibility: WindowVisibility,
@@ -107,6 +120,11 @@ impl TestWindow {
             should_close_handler: None,
             close_callback: None,
             hit_test_window_control_callback: None,
+            hovered: false,
+            caption_chrome_changed_callback: None,
+            caption_state: CaptionChromeState::default(),
+            #[cfg(any(target_os = "windows", test))]
+            published_layouts: Vec::new(),
             input_callback: None,
             active_status_change_callback: None,
             visibility: WindowVisibility::Visible,
@@ -294,7 +312,74 @@ impl TestWindow {
         self.0.lock().request_frame_callback = Some(callback);
     }
 
+    /// Simulates a native window-control hit-test query at `point`, in client logical
+    /// pixels (Snafu), the way a real hit-test message does: take, call, restore.
+    pub fn simulate_window_control_hit_test(
+        &mut self,
+        point: Point<Pixels>,
+    ) -> Option<WindowControlArea> {
+        let mut lock = self.0.lock();
+        let mut callback = lock.hit_test_window_control_callback.take()?;
+        drop(lock);
+        let area = callback(point);
+        self.0.lock().hit_test_window_control_callback = Some(callback);
+        area
+    }
+
+    /// Replaces the caption snapshot as a real attach, detach or metric update does
+    /// (Snafu), then fires the chrome-changed callback once if the snapshot changed.
+    pub fn set_caption_chrome_state(&mut self, state: CaptionChromeState) {
+        let mut lock = self.0.lock();
+        if lock.caption_state == state {
+            return;
+        }
+        lock.caption_state = state;
+        let Some(mut callback) = lock.caption_chrome_changed_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().caption_chrome_changed_callback = Some(callback);
+    }
+
+    /// The control layouts published since the window opened, oldest first (Snafu).
+    #[cfg(any(target_os = "windows", test))]
+    pub fn published_window_control_layouts(&self) -> Vec<WindowControlLayout> {
+        self.0.lock().published_layouts.clone()
+    }
+
+    /// Snafu: pointer moves and exits update hover the way a real window reports it,
+    /// so cursor styles apply in tests.
+    fn update_hover_status(&self, position: Option<Point<Pixels>>) {
+        let mut lock = self.0.lock();
+        let size = lock.bounds.size;
+        let hovered = position.is_some_and(|position| {
+            position.x >= Pixels::ZERO
+                && position.y >= Pixels::ZERO
+                && position.x < size.width
+                && position.y < size.height
+        });
+        if lock.hovered == hovered {
+            return;
+        }
+        lock.hovered = hovered;
+        let Some(mut callback) = lock.hover_status_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(hovered);
+        self.0.lock().hover_status_change_callback = Some(callback);
+    }
+
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
+        match &event {
+            PlatformInput::MouseMove(event) => {
+                self.activate();
+                self.update_hover_status(Some(event.position));
+            }
+            PlatformInput::MouseExited(_) => self.update_hover_status(None),
+            _ => {}
+        }
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
@@ -438,7 +523,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_hovered(&self) -> bool {
-        false
+        self.0.lock().hovered
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -547,8 +632,24 @@ impl PlatformWindow for TestWindow {
         self.0.lock().close_callback = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.0.lock().hit_test_window_control_callback = Some(callback);
+    }
+
+    fn on_caption_chrome_changed(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().caption_chrome_changed_callback = Some(callback);
+    }
+
+    fn app_window_caption_state(&self) -> CaptionChromeState {
+        self.0.lock().caption_state
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn publish_window_control_layout(&self, layout: WindowControlLayout) {
+        self.0.lock().published_layouts.push(layout);
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
