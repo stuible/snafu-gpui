@@ -1,4 +1,4 @@
-use crate::{Action, App, Platform, SharedString};
+use crate::{Action, App, Keystroke, Platform, SharedString};
 
 /// A menu of the application, either a main menu or a submenu
 pub struct Menu {
@@ -100,6 +100,11 @@ pub enum MenuItem {
 
         /// Whether this action is disabled
         disabled: bool,
+
+        /// A keystroke shown as this item's shortcut without binding or dispatching it
+        /// (Snafu): the app handles the keystroke on its own guarded key path, so menu
+        /// adapters must present it as text only, never as an OS accelerator.
+        display_keystroke: Option<Keystroke>,
     },
 }
 
@@ -130,6 +135,7 @@ impl MenuItem {
             os_action: None,
             checked: false,
             disabled: false,
+            display_keystroke: None,
         }
     }
 
@@ -145,6 +151,24 @@ impl MenuItem {
             os_action: Some(os_action),
             checked: false,
             disabled: false,
+            display_keystroke: None,
+        }
+    }
+
+    /// Creates a menu item that invokes an action and shows `keystroke` as its
+    /// shortcut, as [`MenuItem::Action`]'s `display_keystroke` describes (Snafu).
+    pub fn action_with_display_keystroke(
+        name: impl Into<SharedString>,
+        action: impl Action,
+        keystroke: Keystroke,
+    ) -> Self {
+        Self::Action {
+            name: name.into(),
+            action: Box::new(action),
+            os_action: None,
+            checked: false,
+            disabled: false,
+            display_keystroke: Some(keystroke),
         }
     }
 
@@ -159,12 +183,14 @@ impl MenuItem {
                 os_action,
                 checked,
                 disabled,
+                display_keystroke,
             } => OwnedMenuItem::Action {
                 name: name.into(),
                 action,
                 os_action,
                 checked,
                 disabled,
+                display_keystroke,
             },
             MenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.owned()),
         }
@@ -274,6 +300,11 @@ pub enum OwnedMenuItem {
 
         /// Whether this action is disabled
         disabled: bool,
+
+        /// A keystroke shown as this item's shortcut without binding or dispatching it
+        /// (Snafu): the app handles the keystroke on its own guarded key path, so menu
+        /// adapters must present it as text only, never as an OS accelerator.
+        display_keystroke: Option<Keystroke>,
     },
 }
 
@@ -288,12 +319,14 @@ impl Clone for OwnedMenuItem {
                 os_action,
                 checked,
                 disabled,
+                display_keystroke,
             } => OwnedMenuItem::Action {
                 name: name.clone(),
                 action: action.boxed_clone(),
                 os_action: *os_action,
                 checked: *checked,
                 disabled: *disabled,
+                display_keystroke: display_keystroke.clone(),
             },
             OwnedMenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.clone()),
         }
