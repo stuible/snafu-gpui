@@ -300,6 +300,13 @@ impl MacPlatform {
                     let app: *mut AnyObject = msg_send![APP_CLASS, sharedApplication];
                     let _: () = msg_send![app, setWindowsMenu: &*menu];
                 }
+                // Snafu: AppKit wires Cmd-? and Help search to the Help menu only when it
+                // is registered with the public setHelpMenu:, not by title. Like
+                // setWindowsMenu:, each rebuild replaces the registration.
+                if menu_config.name == "Help" {
+                    let app: *mut AnyObject = msg_send![APP_CLASS, sharedApplication];
+                    let _: () = msg_send![app, setHelpMenu: &*menu];
+                }
             }
 
             application_menu
