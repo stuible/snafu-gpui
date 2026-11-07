@@ -78,6 +78,15 @@ impl Drop for DrawWindowGuard<'_> {
 }
 
 impl WindowsWindowInner {
+    /// Whether the native caption is attached to this window (Snafu), from its own
+    /// snapshot; there is no any-window global flag.
+    fn caption_active(&self) -> bool {
+        self.caption_state
+            .lock()
+            .map(|state| state.active)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn handle_msg(
         self: &Rc<Self>,
         handle: HWND,
@@ -93,16 +102,32 @@ impl WindowsWindowInner {
             // press, `DefWindowProc` never sees it, so the window is never activated at all.
             // So, let's eagerly activate the window.
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
-            WM_ACTIVATE => self.handle_activate_msg(wparam),
+            WM_ACTIVATE => {
+                let result = self.handle_activate_msg(wparam);
+                // Snafu: activation changes the SDK title bar's insets; queue a metric
+                // invalidation for the loop owner instead of SDK work here.
+                crate::app_window_caption::enqueue_metric_invalidation(self);
+                result
+            }
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
-            WM_SIZE => self.handle_size_msg(wparam, lparam),
+            WM_SIZE => {
+                let result = self.handle_size_msg(wparam, lparam);
+                crate::app_window_caption::enqueue_metric_invalidation(self);
+                result
+            }
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
             WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
             WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
             WM_TIMER => self.handle_timer_msg(handle, wparam),
             WM_NCCALCSIZE => self.handle_calc_client_size(handle, wparam, lparam),
-            WM_DPICHANGED => self.handle_dpi_changed_msg(handle, wparam, lparam),
+            WM_DPICHANGED => {
+                // The DPI handler runs first (it emits WM_SIZE and updates the scale);
+                // the caption invalidation is queued after it.
+                let result = self.handle_dpi_changed_msg(handle, wparam, lparam);
+                crate::app_window_caption::enqueue_metric_invalidation(self);
+                result
+            }
             WM_DISPLAYCHANGE => self.handle_display_change_msg(handle),
             WM_NCHITTEST => self.handle_hit_test_msg(handle, lparam),
             WM_PAINT => self.handle_paint_msg(handle),
@@ -154,7 +179,14 @@ impl WindowsWindowInner {
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
-            WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
+            WM_SHOWWINDOW => {
+                if wparam.0 != 0 {
+                    // Snafu: queue the caption attach for the loop owner, never SDK work
+                    // inside this dispatch.
+                    crate::app_window_caption::enqueue_attach(self);
+                }
+                self.handle_window_visibility_changed(handle, wparam)
+            }
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             WM_GPUI_CURSOR_STYLE_CHANGED
@@ -315,11 +347,52 @@ impl WindowsWindowInner {
         self.draw_window(handle, false)
     }
 
-    fn handle_close_msg(&self) -> Option<isize> {
+    fn handle_close_msg(self: &Rc<Self>) -> Option<isize> {
+        if crate::app_window_caption::lifecycle_enabled() {
+            // Snafu: with the native caption, close is admitted through the lifecycle
+            // token and never falls through to DefWindowProc's destroy.
+            return Some(self.handle_admitted_close_msg());
+        }
         let mut callback = self.state.callbacks.should_close.take()?;
         let should_close = callback();
         self.state.callbacks.should_close.set(Some(callback));
         if should_close { None } else { Some(0) }
+    }
+
+    /// Native-caption close admission (Snafu), phased on the lifecycle token
+    /// (`Idle` → `CallbackRunning` → `DestroyQueued`, `Dead` terminal). The callback runs
+    /// at most once per admitted request, outside every state borrow; a nested
+    /// `WM_CLOSE` during the callback or after a queued destroy is answered without
+    /// running it; a window without a close callback closes; Cancel returns to `Idle`;
+    /// an approval queues exactly one destroy, deduplicated with the owner-drop path.
+    /// Always handled (0): nothing here reaches DefWindowProc's destroy.
+    fn handle_admitted_close_msg(self: &Rc<Self>) -> isize {
+        let lifetime = &self.lifetime;
+        if !lifetime.is_alive() || !lifetime.begin_close_callback() {
+            return 0;
+        }
+        let Some(mut callback) = self.state.callbacks.should_close.take() else {
+            if lifetime.approve_close() {
+                crate::app_window_caption::enqueue_destroy(self);
+            }
+            return 0;
+        };
+        let should_close = callback();
+        // Restore the callback only while this identity lives, and never over one a
+        // reentrant registration installed during the call.
+        if lifetime.is_alive() {
+            let replaced = self.state.callbacks.should_close.take();
+            self.state
+                .callbacks
+                .should_close
+                .set(Some(replaced.unwrap_or(callback)));
+        }
+        if should_close && lifetime.approve_close() {
+            crate::app_window_caption::enqueue_destroy(self);
+        } else if !should_close {
+            lifetime.cancel_close_callback();
+        }
+        0
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
@@ -767,6 +840,11 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if self.caption_active() {
+            // Snafu: with the native caption attached the SDK and system own the client
+            // rect; GPUI must not subtract its own insets on top.
+            return None;
+        }
         if !self.hide_title_bar || self.state.is_fullscreen() || wparam.0 == 0 {
             return None;
         }
@@ -953,13 +1031,36 @@ impl WindowsWindowInner {
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        if self.caption_active() {
+            // Snafu: with the native caption attached, the SDK's subclass chain owns
+            // non-client hit testing; GPUI's classification stands only when detached.
+            return None;
+        }
         if self.state.is_fullscreen() {
             return None;
         }
 
-        let callback = self.state.callbacks.hit_test_window_control.take();
-        let drag_area = if let Some(mut callback) = callback {
-            let area = callback();
+        // Snafu: classify the message's own point, converted for this HWND, rather than
+        // whatever control the pointer last hovered.
+        let mut query_point = POINT {
+            x: lparam.signed_loword().into(),
+            y: lparam.signed_hiword().into(),
+        };
+        let query = unsafe { ScreenToClient(handle, &mut query_point) }
+            .ok()
+            .map(|_| {
+                logical_point(
+                    query_point.x as f32,
+                    query_point.y as f32,
+                    self.state.scale_factor.get(),
+                )
+            });
+        let callback = query
+            .is_ok()
+            .then(|| self.state.callbacks.hit_test_window_control.take())
+            .flatten();
+        let drag_area = if let (Some(mut callback), Ok(point)) = (callback, query) {
+            let area = callback(point);
             self.state
                 .callbacks
                 .hit_test_window_control
@@ -974,6 +1075,7 @@ impl WindowsWindowInner {
                 WindowControlArea::Min if self.is_minimizable => Some(HTMINBUTTON as _),
                 WindowControlArea::Min if self.is_movable => Some(HTCAPTION as _),
                 WindowControlArea::Min => Some(HTNOWHERE as _),
+                WindowControlArea::Passthrough => Some(HTCLIENT as _),
             })
         } else {
             None
@@ -1021,6 +1123,10 @@ impl WindowsWindowInner {
     }
 
     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        if self.caption_active() {
+            // Snafu: the SDK's input source owns non-client pointer input while attached.
+            return None;
+        }
         self.start_tracking_mouse(handle, TME_LEAVE | TME_NONCLIENT);
         self.restore_cursor_after_hide();
 
@@ -1050,6 +1156,10 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if self.caption_active() {
+            // Snafu: SDK-owned non-client input while the native caption is attached.
+            return None;
+        }
         if let Some(mut func) = self.state.callbacks.input.take() {
             let scale_factor = self.state.scale_factor.get();
             let mut cursor_point = POINT {
@@ -1097,6 +1207,10 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if self.caption_active() {
+            // Snafu: SDK-owned non-client input while the native caption is attached.
+            return None;
+        }
         if let Some(mut func) = self.state.callbacks.input.take() {
             let scale_factor = self.state.scale_factor.get();
 

@@ -625,24 +625,54 @@ impl Platform for WindowsPlatform {
         if !self.headless {
             self.connect_initially();
         }
+        // Snafu: the AppWindow caption host is created on this thread before the launch
+        // callback and before any SDK window mutation. It drives queued caption work only
+        // between outer message turns (never inside a dispatch or under a GPUI borrow), and
+        // is inert when the native caption is disabled.
+        let mut caption_host = crate::app_window_caption::CaptionHost::new(
+            self.handle,
+            self.inner.validation_number,
+        );
         on_finish_launching();
+        caption_host.drive();
 
         let mut msg = MSG::default();
-        unsafe {
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                if !self.inner.translate_accelerator(&msg) {
-                    _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+        let pump_failed = unsafe {
+            loop {
+                // Distinguish a message (>0), WM_QUIT (0) and the -1 error: only a clean 0
+                // is an approved exit, and an error goes through the epilogue's policy.
+                let received = GetMessageW(&mut msg, None, 0, 0);
+                if received.0 > 0 {
+                    // The App SDK subclass chain gets the first look while a caption is
+                    // attached; a consumed message is still followed by a drive.
+                    if caption_host.pretranslate(&msg) {
+                        caption_host.drive();
+                        continue;
+                    }
+                    if !self.inner.translate_accelerator(&msg) {
+                        _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    caption_host.drive();
+                    continue;
                 }
+                if received.0 < 0 {
+                    log::error!("GetMessageW failed: {:?}", GetLastError());
+                }
+                break received.0 < 0;
             }
-        }
+        };
 
+        // Seal new attachments, run the quit callback outside every platform borrow, then
+        // follow the caption host's terminal ownership policy.
+        caption_host.seal();
         self.inner.with_callback(
             |callbacks| &callbacks.quit,
             |callback| {
                 callback();
             },
         );
+        caption_host.epilogue(pump_failed);
     }
 
     fn quit(&self) {

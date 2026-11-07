@@ -1,0 +1,12 @@
+[package]
+name = "appwindow-bindgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+windows-bindgen = "=0.100.0"
+
+[[bin]]
+name = "appwindow-bindgen"
+path = "main.rs"

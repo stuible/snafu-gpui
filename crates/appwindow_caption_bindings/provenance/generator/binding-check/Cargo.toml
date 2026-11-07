@@ -1,0 +1,13 @@
+[package]
+name = "snafu-appwindow-binding-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+windows-core = "=0.100.0"
+windows-future = "=0.100.0"
+windows-reference = "=0.100.0"
+
+[lib]
+path = "src/lib.rs"

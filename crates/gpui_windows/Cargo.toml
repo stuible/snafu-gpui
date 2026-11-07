@@ -22,6 +22,8 @@ gpui.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 accesskit.workspace = true
+# Snafu: private ABI-isolation crate for the AppWindow caption bindings (windows-core 0.100).
+appwindow-caption-bindings = { path = "../appwindow_caption_bindings" }
 accesskit_windows.workspace = true
 anyhow.workspace = true
 collections.workspace = true
@@ -39,6 +41,8 @@ scheduler.workspace = true
 smallvec.workspace = true
 uuid = { workspace = true, features = ["v5"] }
 windows = { workspace = true, features = [
+    # Snafu: the AppWindow caption host (RoInitialize and the WinRT runtime).
+    "Win32_System_WinRT",
     "Data_Xml_Dom",
     "UI_Notifications",
     "UI_ViewManagement",

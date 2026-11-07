@@ -1,0 +1,11 @@
+[package]
+name = "appwindow-caption-bindings"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Private ABI-isolation crate for the native AppWindow caption (see src/lib.rs).
+[dependencies]
+windows-core = "=0.100.0"
+windows-future = "=0.100.0"
+windows-reference = "=0.100.0"

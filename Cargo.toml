@@ -106,6 +106,7 @@ members = [
     "crates/gpui_web",
     "crates/gpui_wgpu",
     "crates/gpui_windows",
+    "crates/appwindow_caption_bindings",
     "crates/grammars",
     "crates/hang_telemetry",
     "crates/html_to_markdown",

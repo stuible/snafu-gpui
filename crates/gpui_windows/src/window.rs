@@ -28,6 +28,7 @@ use windows::{
     core::*,
 };
 
+use crate::app_window_caption::support::window_lifetime::WindowLifetime;
 use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
 use gpui::*;
@@ -108,6 +109,14 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    /// Snafu: the native-lifetime token the AppWindow caption host keys on.
+    pub(crate) lifetime: Rc<WindowLifetime>,
+    /// Snafu: this window's caption snapshot.
+    pub(crate) caption_state: std::sync::Mutex<CaptionChromeState>,
+    /// Snafu: the last published window-control layout, waiting for the host.
+    pub(crate) pending_layout: std::sync::Mutex<Option<gpui::WindowControlLayout>>,
+    /// Snafu: bumped on every metric change so stale layouts never apply.
+    pub(crate) metric_revision: std::sync::atomic::AtomicU64,
 }
 
 impl WindowsWindowState {
@@ -298,6 +307,10 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
+            lifetime: Rc::new(WindowLifetime::allocate()),
+            caption_state: std::sync::Mutex::new(CaptionChromeState::default()),
+            pending_layout: std::sync::Mutex::new(None),
+            metric_revision: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -347,6 +360,9 @@ impl WindowsWindowInner {
                     }
                 };
                 set_non_rude_hwnd(this.hwnd, !this.state.is_fullscreen());
+                // Snafu: the style change rewrites the frame; retire stored layouts first
+                // so stale drag regions cannot survive into or out of fullscreen.
+                crate::app_window_caption::enqueue_metric_invalidation(&this);
                 unsafe { set_window_long(this.hwnd, GWL_STYLE, style.0 as isize) };
                 unsafe {
                     SetWindowPos(
@@ -364,7 +380,9 @@ impl WindowsWindowInner {
             .detach();
     }
 
-    fn set_window_placement(self: &Rc<Self>) -> Result<()> {
+    /// Performs the first show from the recorded open status, consuming it. Called by
+    /// `activate` and by the caption host's prepared show continuation (Snafu).
+    pub(crate) fn set_window_placement(self: &Rc<Self>) -> Result<()> {
         let Some(open_status) = self.state.initial_placement.take() else {
             return Ok(());
         };
@@ -392,6 +410,59 @@ impl WindowsWindowInner {
     pub(crate) fn system_settings(&self) -> &WindowsSystemSettings {
         &self.system_settings
     }
+
+    // Snafu: the narrow surface the AppWindow caption host uses.
+
+    pub(crate) fn caption_hwnd_value(&self) -> isize {
+        self.hwnd.0 as isize
+    }
+
+    /// Replaces the caption snapshot and, when it changed, fires the chrome-changed
+    /// callback outside every borrow so the GPUI window rebuilds.
+    pub(crate) fn set_caption_state(&self, state: CaptionChromeState) {
+        let changed = match self.caption_state.lock() {
+            Ok(mut current) => {
+                let changed = *current != state;
+                *current = state;
+                changed
+            }
+            Err(_) => false,
+        };
+        if !changed {
+            return;
+        }
+        if let Some(mut callback) = self.state.callbacks.caption_chrome_changed.take() {
+            callback();
+            let replaced = self.state.callbacks.caption_chrome_changed.take();
+            self.state
+                .callbacks
+                .caption_chrome_changed
+                .set(Some(replaced.unwrap_or(callback)));
+        }
+    }
+
+    pub(crate) fn current_metric_revision(&self) -> u64 {
+        self.metric_revision
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn stored_layout(&self) -> Option<gpui::WindowControlLayout> {
+        self.pending_layout
+            .lock()
+            .ok()
+            .and_then(|pending| pending.clone())
+    }
+
+    /// Retires the stored layout and bumps the metric revision, so no payload measured
+    /// before a resize, DPI or activation change can apply.
+    pub(crate) fn invalidate_metric_revision(&self) -> u64 {
+        if let Ok(mut pending) = self.pending_layout.lock() {
+            *pending = None;
+        }
+        self.metric_revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
 }
 
 #[derive(Default)]
@@ -406,7 +477,10 @@ pub(crate) struct Callbacks {
     pub(crate) display_changed: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) should_close: Cell<Option<Box<dyn FnMut() -> bool>>>,
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
-    pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
+    pub(crate) hit_test_window_control:
+        Cell<Option<Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>>>,
+    /// Snafu: marks the GPUI window dirty when the caption snapshot changes.
+    pub(crate) caption_chrome_changed: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -575,7 +649,20 @@ impl WindowsWindow {
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
-        if params.show {
+        if params.show && crate::app_window_caption::enqueue_prepare_for_show(&this) {
+            // Snafu: the caption host admitted the prepare command, so the window stays
+            // hidden while the loop owner attaches (or falls back) outside every borrow
+            // and then performs the first show itself; the native title bar is never
+            // seen unstyled.
+            let mut placement = placement;
+            if !params.focus {
+                placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+            }
+            this.state.initial_placement.set(Some(WindowOpenStatus {
+                placement,
+                state: WindowOpenState::Windowed,
+            }));
+        } else if params.show {
             let mut placement = placement;
             if !params.focus {
                 placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
@@ -615,6 +702,14 @@ impl Drop for WindowsWindow {
         // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
         // resulting visibility report has nothing to notify.
         self.0.state.callbacks.visibility_change.take();
+        if crate::app_window_caption::lifecycle_enabled() {
+            // Snafu: with the native caption, destruction goes through the lifecycle
+            // token, deduplicated with an approved WM_CLOSE.
+            if self.0.lifetime.admit_owner_destroy() {
+                crate::app_window_caption::enqueue_destroy(&self.0);
+            }
+            return;
+        }
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -818,6 +913,11 @@ impl PlatformWindow for WindowsWindow {
         self.0
             .executor
             .spawn(async move {
+                if this.lifetime.deferred_show_pending() {
+                    // Snafu: the caption host's prepared continuation owns the first show;
+                    // showing here would expose the unstyled native title bar early.
+                    return;
+                }
                 this.set_window_placement().log_err();
 
                 unsafe {
@@ -1017,12 +1117,61 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.close.set(Some(callback));
     }
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.0
             .state
             .callbacks
             .hit_test_window_control
             .set(Some(callback));
+    }
+
+    fn on_caption_chrome_changed(&self, callback: Box<dyn FnMut()>) {
+        self.0
+            .state
+            .callbacks
+            .caption_chrome_changed
+            .set(Some(callback));
+    }
+
+    fn app_window_caption_state(&self) -> CaptionChromeState {
+        self.0
+            .caption_state
+            .lock()
+            .map(|state| *state)
+            .unwrap_or_default()
+    }
+
+    fn publish_window_control_layout(&self, mut layout: gpui::WindowControlLayout) {
+        if !crate::app_window_caption::lifecycle_enabled() {
+            return;
+        }
+        let content_size = self.0.state.content_size();
+        let scale_factor = self.0.state.scale_factor.get();
+        let current = (f32::from(layout.client_size.width) - f32::from(content_size.width))
+            .abs()
+            <= 0.5
+            && (f32::from(layout.client_size.height) - f32::from(content_size.height)).abs() <= 0.5
+            && (layout.scale_factor - scale_factor).abs() <= 0.001;
+        if !current {
+            log::warn!(
+                "dropped a window-control layout measured under {:?} at scale {}; the window \
+                 is now {:?} at scale {}, and the next frame publishes fresh",
+                layout.client_size,
+                layout.scale_factor,
+                content_size,
+                scale_factor
+            );
+            return;
+        }
+        layout.identity = self.0.lifetime.id();
+        layout.metric_revision = self.0.current_metric_revision();
+        if let Ok(mut pending) = self.0.pending_layout.lock() {
+            *pending = Some(layout);
+        }
+        crate::app_window_caption::enqueue_apply_regions(&self.0);
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -1449,10 +1598,28 @@ unsafe extern "system" fn window_procedure(
         let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;
         let window_creation_context = unsafe { &mut *window_creation_context };
+        if !crate::app_window_caption::native_creation_admitted() {
+            // Snafu: in the caption terminal phase no new HWND may come to exist;
+            // CreateWindowExW fails and the caller sees this error.
+            window_creation_context.inner = Some(Err(anyhow::anyhow!(
+                "native window creation refused during the caption terminal phase"
+            )));
+            return LRESULT(0);
+        }
         return match WindowsWindowInner::new(window_creation_context, hwnd, window_params) {
             Ok(window_state) => {
-                let weak = Box::new(Rc::downgrade(&window_state));
-                unsafe { set_window_long(hwnd, GWLP_USERDATA, Box::into_raw(weak) as isize) };
+                // Snafu: the userdata holds the lifetime token (which outlives the inner)
+                // and the weak inner, and every window registers with the caption host at
+                // creation, attached or not.
+                let userdata = Box::new(WindowUserData {
+                    lifetime: Rc::clone(&window_state.lifetime),
+                    window: Rc::downgrade(&window_state),
+                });
+                crate::app_window_caption::enqueue_register(
+                    Rc::clone(&userdata.lifetime),
+                    hwnd.0 as isize,
+                );
+                unsafe { set_window_long(hwnd, GWLP_USERDATA, Box::into_raw(userdata) as isize) };
                 window_creation_context.inner = Some(Ok(window_state));
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
@@ -1463,12 +1630,18 @@ unsafe extern "system" fn window_procedure(
         };
     }
 
-    let ptr = unsafe { get_window_long(hwnd, GWLP_USERDATA) } as *mut Weak<WindowsWindowInner>;
+    let ptr = unsafe { get_window_long(hwnd, GWLP_USERDATA) } as *mut WindowUserData;
     if ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    let inner = unsafe { &*ptr };
-    let result = if let Some(inner) = inner.upgrade() {
+    let userdata = unsafe { &*ptr };
+    if msg == WM_NCDESTROY {
+        // Snafu: retire the identity and queue the caption cleanup before dispatch; the
+        // token carries it even when the inner can no longer upgrade.
+        userdata.lifetime.retire();
+        crate::app_window_caption::enqueue_cleanup(Rc::clone(&userdata.lifetime), hwnd.0 as isize);
+    }
+    let result = if let Some(inner) = userdata.window.upgrade() {
         if msg == WM_NCDESTROY {
             inner.dialog_owner.close();
         }
@@ -1485,15 +1658,21 @@ unsafe extern "system" fn window_procedure(
     result
 }
 
+/// A window's GWLP_USERDATA (Snafu): the caption lifetime token plus the weak inner.
+struct WindowUserData {
+    lifetime: Rc<WindowLifetime>,
+    window: Weak<WindowsWindowInner>,
+}
+
 pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
     if hwnd.is_invalid() {
         return None;
     }
 
-    let ptr = unsafe { get_window_long(hwnd, GWLP_USERDATA) } as *mut Weak<WindowsWindowInner>;
+    let ptr = unsafe { get_window_long(hwnd, GWLP_USERDATA) } as *mut WindowUserData;
     if !ptr.is_null() {
-        let inner = unsafe { &*ptr };
-        inner.upgrade()
+        let userdata = unsafe { &*ptr };
+        userdata.window.upgrade()
     } else {
         None
     }

@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+mod app_window_caption;
 mod clipboard;
 mod custom_cursor;
 mod destination_list;

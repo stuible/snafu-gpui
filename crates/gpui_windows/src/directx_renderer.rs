@@ -1014,7 +1014,20 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // Snafu: the AppWindow caption draws its buttons in a child window, so the
+        // composition target goes below children while the native caption is enabled
+        // (above, upstream's default, when SNAFU_DISABLE_NATIVE_CAPTION=1). Device-reset
+        // reconstruction comes through here too, so both use the same layer.
+        let topmost = !crate::app_window_caption::native_caption_enabled();
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, topmost) };
+        log::info!(
+            "DirectComposition target layer: topmost={topmost} (CreateTargetForHwnd {})",
+            match &comp_target {
+                Ok(_) => "succeeded".to_owned(),
+                Err(error) => format!("failed: {error}"),
+            },
+        );
+        let comp_target = comp_target?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
