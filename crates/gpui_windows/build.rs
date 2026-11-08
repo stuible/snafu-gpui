@@ -5,8 +5,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(target_os = "windows")]
     {
-        // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
+        // Compile HLSL shaders ahead of time, unless the renderer compiles them at runtime
+        // (Snafu: `runtime_shaders`, for builds without fxc).
+        #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
         compile_shaders();
     }
 }

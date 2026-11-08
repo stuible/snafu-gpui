@@ -13,7 +13,10 @@ path = "src/gpui_platform.rs"
 doctest = false
 
 [features]
-default = ["multithreaded"]
+default = ["multithreaded", "windows-manifest"]
+# Snafu: GPUI's Windows manifest as a default feature rather than forced, so an app that
+# embeds its own manifest can opt out (two manifests fail to link).
+windows-manifest = ["gpui/windows-manifest"]
 # Threads in the browser: needs a nightly toolchain and a cross-origin-isolated
 # page. Off, gpui_web builds on stable.
 multithreaded = ["gpui_web/multithreaded"]
@@ -22,7 +25,11 @@ font-kit = ["gpui_macos/font-kit"]
 inspector = ["gpui/inspector"]
 test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support", "gpui_wgpu/test-support"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
-runtime_shaders = ["gpui_macos/runtime_shaders", "gpui_ios/runtime_shaders"]
+runtime_shaders = [
+    "gpui_macos/runtime_shaders",
+    "gpui_ios/runtime_shaders",
+    "gpui_windows/runtime_shaders",
+]
 wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
 
@@ -63,7 +70,7 @@ gpui_ios.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows.workspace = true
-gpui = { workspace = true, features = ["windows-manifest"] }
+gpui.workspace = true
 
 [target.'cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "ohos")))'.dependencies]
 gpui_linux.workspace = true

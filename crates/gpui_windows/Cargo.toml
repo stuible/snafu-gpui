@@ -16,6 +16,8 @@ doctest = false
 default = ["gpui/default"]
 test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
+# Snafu: compile HLSL at runtime from embedded source, so release builds need no fxc.
+runtime_shaders = []
 
 [dependencies]
 gpui.workspace = true
