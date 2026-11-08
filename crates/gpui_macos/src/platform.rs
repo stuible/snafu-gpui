@@ -349,6 +349,7 @@ impl MacPlatform {
                     os_action,
                     checked,
                     disabled,
+                    alternate,
                     ..
                 } => {
                     // Note that this is intentionally using earlier bindings, whereas typically
@@ -439,6 +440,9 @@ impl MacPlatform {
                         item.setState(NSControlStateValueOn);
                     }
                     item.setEnabled(!disabled);
+                    if *alternate {
+                        item.setAlternate(true);
+                    }
 
                     let tag = actions.len() as NSInteger;
                     item.setTag(tag);

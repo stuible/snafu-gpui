@@ -105,6 +105,12 @@ pub enum MenuItem {
         /// (Snafu): the app handles the keystroke on its own guarded key path, so menu
         /// adapters must present it as text only, never as an OS accelerator.
         display_keystroke: Option<Keystroke>,
+
+        /// Whether this item is the Option/Shift alternate of the item before it (Snafu).
+        /// AppKit shows it in place of that item while its extra modifiers are held; the
+        /// two items' shortcuts must share a key and differ only in modifiers. Adapters
+        /// without alternates show only the primary item unless they swap it themselves.
+        alternate: bool,
     },
 }
 
@@ -136,6 +142,7 @@ impl MenuItem {
             checked: false,
             disabled: false,
             display_keystroke: None,
+            alternate: false,
         }
     }
 
@@ -152,6 +159,7 @@ impl MenuItem {
             checked: false,
             disabled: false,
             display_keystroke: None,
+            alternate: false,
         }
     }
 
@@ -169,6 +177,7 @@ impl MenuItem {
             checked: false,
             disabled: false,
             display_keystroke: Some(keystroke),
+            alternate: false,
         }
     }
 
@@ -184,6 +193,7 @@ impl MenuItem {
                 checked,
                 disabled,
                 display_keystroke,
+                alternate,
             } => OwnedMenuItem::Action {
                 name: name.into(),
                 action,
@@ -191,6 +201,7 @@ impl MenuItem {
                 checked,
                 disabled,
                 display_keystroke,
+                alternate,
             },
             MenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.owned()),
         }
@@ -205,6 +216,15 @@ impl MenuItem {
                 *old = checked;
             }
             _ => {}
+        }
+        self
+    }
+
+    /// Mark this item as the alternate of the item before it, as
+    /// [`MenuItem::Action`]'s `alternate` describes (Snafu). Ignored for other items.
+    pub fn alternate(mut self) -> Self {
+        if let MenuItem::Action { alternate, .. } = &mut self {
+            *alternate = true;
         }
         self
     }
@@ -305,6 +325,12 @@ pub enum OwnedMenuItem {
         /// (Snafu): the app handles the keystroke on its own guarded key path, so menu
         /// adapters must present it as text only, never as an OS accelerator.
         display_keystroke: Option<Keystroke>,
+
+        /// Whether this item is the Option/Shift alternate of the item before it (Snafu).
+        /// AppKit shows it in place of that item while its extra modifiers are held; the
+        /// two items' shortcuts must share a key and differ only in modifiers. Adapters
+        /// without alternates show only the primary item unless they swap it themselves.
+        alternate: bool,
     },
 }
 
@@ -320,6 +346,7 @@ impl Clone for OwnedMenuItem {
                 checked,
                 disabled,
                 display_keystroke,
+                alternate,
             } => OwnedMenuItem::Action {
                 name: name.clone(),
                 action: action.boxed_clone(),
@@ -327,6 +354,7 @@ impl Clone for OwnedMenuItem {
                 checked: *checked,
                 disabled: *disabled,
                 display_keystroke: display_keystroke.clone(),
+                alternate: *alternate,
             },
             OwnedMenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.clone()),
         }
