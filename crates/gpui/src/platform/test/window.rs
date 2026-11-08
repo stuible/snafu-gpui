@@ -38,6 +38,9 @@ pub(crate) struct TestWindowState {
         Option<Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>>,
     /// Snafu: whether simulated pointer input is inside the window.
     hovered: bool,
+    /// Snafu: the pointer position from the last simulated pointer event, reported as a
+    /// real platform reports the pointer (resizes re-read it).
+    mouse_position: Point<Pixels>,
     caption_chrome_changed_callback: Option<Box<dyn FnMut()>>,
     /// Snafu: the caption snapshot the platform reports; tests install one to exercise
     /// the measured native-header layout.
@@ -121,6 +124,7 @@ impl TestWindow {
             close_callback: None,
             hit_test_window_control_callback: None,
             hovered: false,
+            mouse_position: Point::default(),
             caption_chrome_changed_callback: None,
             caption_state: CaptionChromeState::default(),
             #[cfg(any(target_os = "windows", test))]
@@ -372,6 +376,15 @@ impl TestWindow {
     }
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
+        let position = match &event {
+            PlatformInput::MouseMove(event) => Some(event.position),
+            PlatformInput::MouseDown(event) => Some(event.position),
+            PlatformInput::MouseUp(event) => Some(event.position),
+            _ => None,
+        };
+        if let Some(position) = position {
+            self.0.lock().mouse_position = position;
+        }
         match &event {
             PlatformInput::MouseMove(event) => {
                 self.activate();
@@ -461,7 +474,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        Point::default()
+        self.0.lock().mouse_position
     }
 
     fn modifiers(&self) -> crate::Modifiers {
