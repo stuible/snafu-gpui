@@ -42,6 +42,8 @@ pub(crate) struct TestWindowState {
     /// real platform reports the pointer (resizes re-read it).
     mouse_position: Point<Pixels>,
     caption_chrome_changed_callback: Option<Box<dyn FnMut()>>,
+    /// Snafu: the accessibility adapter's callbacks, so tests can act as a screen reader.
+    a11y_callbacks: Option<Rc<crate::A11yCallbacks>>,
     /// Snafu: the caption snapshot the platform reports; tests install one to exercise
     /// the measured native-header layout.
     pub(crate) caption_state: CaptionChromeState,
@@ -126,6 +128,7 @@ impl TestWindow {
             hovered: false,
             mouse_position: Point::default(),
             caption_chrome_changed_callback: None,
+            a11y_callbacks: None,
             caption_state: CaptionChromeState::default(),
             #[cfg(any(target_os = "windows", test))]
             published_layouts: Vec::new(),
@@ -344,6 +347,23 @@ impl TestWindow {
         drop(lock);
         callback();
         self.0.lock().caption_chrome_changed_callback = Some(callback);
+    }
+
+    /// Connect a simulated screen reader (Snafu): the window starts building its
+    /// accessibility tree from the next frame.
+    pub fn activate_accessibility(&self) {
+        let callbacks = self.0.lock().a11y_callbacks.clone();
+        if let Some(callbacks) = callbacks {
+            (callbacks.activation)();
+        }
+    }
+
+    /// Send an assistive-technology action request, as a screen reader would (Snafu).
+    pub fn simulate_a11y_action(&self, request: accesskit::ActionRequest) {
+        let callbacks = self.0.lock().a11y_callbacks.clone();
+        if let Some(callbacks) = callbacks {
+            (callbacks.action)(request);
+        }
     }
 
     /// The control layouts published since the window opened, oldest first (Snafu).
@@ -650,6 +670,10 @@ impl PlatformWindow for TestWindow {
         callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
     ) {
         self.0.lock().hit_test_window_control_callback = Some(callback);
+    }
+
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        self.0.lock().a11y_callbacks = Some(Rc::new(callbacks));
     }
 
     fn on_caption_chrome_changed(&self, callback: Box<dyn FnMut()>) {

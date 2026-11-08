@@ -908,6 +908,19 @@ pub struct PublishedWindowControlLayout {
 }
 
 impl VisualTestContext {
+    /// Connect a simulated screen reader to this window (Snafu); the next frame builds
+    /// the accessibility tree, readable through `Window::debug_a11y_tree_json`.
+    pub fn activate_accessibility(&mut self) {
+        self.cx.test_window(self.window).activate_accessibility();
+        self.background_executor.run_until_parked();
+    }
+
+    /// Send a screen reader's action request to this window (Snafu).
+    pub fn simulate_a11y_action(&mut self, request: accesskit::ActionRequest) {
+        self.cx.test_window(self.window).simulate_a11y_action(request);
+        self.background_executor.run_until_parked();
+    }
+
     /// Simulates a native window-control hit-test query at `point` in this window
     /// (Snafu); see [`TestAppContext::simulate_window_control_hit_test`].
     pub fn simulate_window_control_hit_test(
