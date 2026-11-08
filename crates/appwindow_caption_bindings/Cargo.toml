@@ -3,6 +3,7 @@ name = "appwindow-caption-bindings"
 version = "0.0.0"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
 
 # Private ABI-isolation crate for the native AppWindow caption (see src/lib.rs).
 [dependencies]
