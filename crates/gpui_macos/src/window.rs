@@ -1125,14 +1125,9 @@ impl MacWindow {
                 screen: target_screen.as_deref()
             ];
             assert!(!native_window.is_null());
-            #[expect(
-                deprecated,
-                reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
-            )]
             let () = msg_send![
                 native_window,
-                registerForDraggedTypes:
-                    &*NSArray::from_slice(&[NSFilenamesPboardType])
+                registerForDraggedTypes: &*dragged_types()
             ];
             let () = msg_send![
                 native_window,
@@ -3830,18 +3825,29 @@ impl Drop for NativeDragContextGuard {
 }
 
 fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPaths> {
-    let mut paths = SmallVec::new();
     let pasteboard: *mut AnyObject = unsafe { msg_send![dragging_info, draggingPasteboard] };
     if pasteboard.is_null() {
         return None;
     }
-    #[expect(
-        deprecated,
-        reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
-    )]
+    external_paths_from_pasteboard(pasteboard)
+}
+
+/// The drag's paths from its board. An ordinary file drag carries its property-list paths
+/// and decodes as before. A board with no paths is admitted only when it is a genuine
+/// file promise (NSFilePromiseReceiver can read it), as an empty path list: the drop's
+/// original is received during Submit, where the app has the board. Any other board, such
+/// as a web URL or text, is not admitted.
+#[expect(
+    deprecated,
+    reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
+)]
+fn external_paths_from_pasteboard(pasteboard: *mut AnyObject) -> Option<ExternalPaths> {
+    let mut paths = SmallVec::new();
     let filenames: *mut NSArray<NSString> =
         unsafe { msg_send![pasteboard, propertyListForType: NSFilenamesPboardType] };
-    let filenames = unsafe { filenames.as_ref() }?;
+    let Some(filenames) = (unsafe { filenames.as_ref() }) else {
+        return board_has_file_promise(pasteboard).then(ExternalPaths::default);
+    };
     for file in filenames {
         let path = unsafe {
             let f = file.UTF8String();
@@ -3850,6 +3856,46 @@ fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPa
         paths.push(PathBuf::from(path))
     }
     Some(ExternalPaths(paths))
+}
+
+/// Whether the board holds a file promise that NSFilePromiseReceiver can read. A web URL
+/// or text board is not a promise, so it reads as false here.
+fn board_has_file_promise(pasteboard: *mut AnyObject) -> bool {
+    let Some(receiver) = AnyClass::get(c"NSFilePromiseReceiver") else {
+        return false;
+    };
+    let classes = NSArray::<AnyClass>::from_slice(&[receiver]);
+    // SAFETY: the board is the live drag pasteboard for this event; the class array and the
+    // nil options are valid arguments to AppKit's can-read query.
+    unsafe {
+        msg_send![
+            pasteboard,
+            canReadObjectForClasses: &*classes,
+            options: std::ptr::null::<AnyObject>()
+        ]
+    }
+}
+
+/// The types the window registers for: the property-list paths Snafu has always taken,
+/// plus the promised-file types NSFilePromiseReceiver reads, so a promise-only drag such
+/// as Safari's image drag reaches the drag destination. Registration adds types only;
+/// ordinary file drags keep the same path type.
+#[expect(
+    deprecated,
+    reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
+)]
+fn dragged_types() -> Retained<NSArray<NSString>> {
+    let readable: Option<Retained<NSArray<NSString>>> = AnyClass::get(c"NSFilePromiseReceiver")
+        .map(|receiver| unsafe { msg_send![receiver, readableDraggedTypes] });
+    let mut types = vec![unsafe { NSFilenamesPboardType }.retain()];
+    if let Some(readable) = &readable {
+        for kind in readable.iter() {
+            if !types.contains(&kind) {
+                types.push(kind);
+            }
+        }
+    }
+    NSArray::from_retained_slice(&types)
 }
 
 extern "C" fn conclude_drag_operation(this: &AnyObject, _: Sel, _: *mut AnyObject) {
@@ -4177,6 +4223,142 @@ extern "C" fn toggle_tab_bar(this: &AnyObject, _sel: Sel, _id: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private board this test owns, released globally at the end so the shared
+    /// pasteboard server keeps nothing from the run.
+    fn private_board() -> Retained<AnyObject> {
+        unsafe { msg_send![class!(NSPasteboard), pasteboardWithUniqueName] }
+    }
+
+    fn release(board: &AnyObject) {
+        let _: () = unsafe { msg_send![board, releaseGlobally] };
+    }
+
+    /// A delegate with the two methods AppKit requires of a file-promise provider. The test
+    /// never asks it to write the promise.
+    fn promise_delegate() -> Retained<AnyObject> {
+        extern "C-unwind" fn file_name(
+            _: &AnyObject,
+            _: Sel,
+            _: *mut AnyObject,
+            _: *mut AnyObject,
+        ) -> *mut AnyObject {
+            Retained::autorelease_return(NSString::from_str("promised.png")).cast()
+        }
+        extern "C-unwind" fn write(
+            _: &AnyObject,
+            _: Sel,
+            _: *mut AnyObject,
+            _: *mut AnyObject,
+            _: *mut AnyObject,
+        ) {
+        }
+        static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+        let class = CLASS.get_or_init(|| {
+            let mut builder = ClassBuilder::new(c"GPUIPromiseTestDelegate", class!(NSObject))
+                .expect("test delegate class");
+            unsafe {
+                builder.add_method(
+                    sel!(filePromiseProvider:fileNameForType:),
+                    file_name as extern "C-unwind" fn(_, _, _, _) -> _,
+                );
+                builder.add_method(
+                    sel!(filePromiseProvider:writePromiseToURL:completionHandler:),
+                    write as extern "C-unwind" fn(_, _, _, _, _),
+                );
+            }
+            builder.register()
+        });
+        unsafe { msg_send![*class, new] }
+    }
+
+    /// Put one file-promise provider of `file_type` on the board, as Safari's image drag does.
+    fn write_promise(board: &AnyObject, file_type: &str) {
+        let file_type = NSString::from_str(file_type);
+        let delegate = promise_delegate();
+        let provider: Retained<AnyObject> = unsafe {
+            let allocated: objc2::rc::Allocated<AnyObject> =
+                msg_send![class!(NSFilePromiseProvider), alloc];
+            msg_send![allocated, initWithFileType: &*file_type, delegate: &*delegate]
+        };
+        let objects = NSArray::<AnyObject>::from_retained_slice(&[provider]);
+        let wrote: bool = unsafe { msg_send![board, writeObjects: &*objects] };
+        assert!(wrote, "the test board took the promise");
+    }
+
+    #[test]
+    fn an_ordinary_path_board_decodes_its_paths() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let path = NSString::from_str("/tmp/snafu-admission/dropped.png");
+            let paths = NSArray::<NSString>::from_slice(&[&*path]);
+            let _: isize = unsafe { msg_send![&*board, clearContents] };
+            #[expect(deprecated, reason = "the test writes the path-list type Snafu reads")]
+            let types = NSArray::<NSString>::from_slice(&[unsafe { NSFilenamesPboardType }]);
+            let _: isize = unsafe {
+                msg_send![&*board, declareTypes: &*types, owner: std::ptr::null::<AnyObject>()]
+            };
+            #[expect(deprecated, reason = "the test writes the path-list type Snafu reads")]
+            let wrote: bool = unsafe {
+                msg_send![&*board, setPropertyList: &*paths, forType: NSFilenamesPboardType]
+            };
+            assert!(wrote);
+            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                .expect("a path board is admitted");
+            assert_eq!(
+                decoded.paths(),
+                [PathBuf::from("/tmp/snafu-admission/dropped.png")]
+            );
+            release(&board);
+        });
+    }
+
+    #[test]
+    fn a_promise_only_board_is_admitted_without_paths() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let _: isize = unsafe { msg_send![&*board, clearContents] };
+            write_promise(&board, "public.png");
+            let available: *mut NSString =
+                unsafe { msg_send![&*board, availableTypeFromArray: &*dragged_types()] };
+            assert!(
+                !available.is_null(),
+                "the window registers a type offered by the promise"
+            );
+            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                .expect("a genuine promise is admitted");
+            assert!(decoded.paths().is_empty(), "the promise supplies no paths");
+            release(&board);
+        });
+    }
+
+    #[test]
+    fn a_web_url_board_is_not_admitted() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let _: isize = unsafe { msg_send![&*board, clearContents] };
+            let url = NSURL::URLWithString(&NSString::from_str("https://example.com/picture.png"))
+                .expect("a web URL");
+            let objects = NSArray::<NSURL>::from_slice(&[&*url]);
+            let wrote: bool = unsafe { msg_send![&*board, writeObjects: &*objects] };
+            assert!(wrote);
+            assert!(
+                external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut()).is_none(),
+                "arbitrary web URLs are not admitted as a drag"
+            );
+            release(&board);
+        });
+    }
+
+    #[test]
+    fn an_empty_board_is_not_admitted() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let _: isize = unsafe { msg_send![&*board, clearContents] };
+            assert!(external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut()).is_none());
+            release(&board);
+        });
+    }
 
     #[test]
     fn display_id_for_screen_handles_missing_metadata() {

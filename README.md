@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # snafu-gpui: Zed's GPUI for Snafu
 
 This is a fork of [Zed](https://github.com/zed-industries/zed) that exists only to supply
