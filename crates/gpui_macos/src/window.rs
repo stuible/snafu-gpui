@@ -3867,7 +3867,7 @@ extern "C" fn perform_drag_operation(
 /// Dispatches Submit with this window's drag pasteboard installed (Snafu). A plain Rust
 /// frame, so the slot guard restores the previous value even if a handler unwinds.
 fn perform_drag_operation_impl(
-    window_state: Arc<Mutex<MacWindowState>>,
+    window_state: Rc<Mutex<MacWindowState>>,
     dragging_info: *mut AnyObject,
 ) -> bool {
     let position = drag_event_position(&window_state, dragging_info);
