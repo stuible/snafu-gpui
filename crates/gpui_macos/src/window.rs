@@ -33,15 +33,11 @@ use objc2::{
     runtime::{AnyClass, AnyObject, AnyProtocol, Bool, ClassBuilder, ProtocolObject, Sel},
     sel,
 };
-#[expect(
-    deprecated,
-    reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
-)]
-use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSAppearance, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep,
     NSButton, NSColor, NSDragOperation, NSDraggingContext, NSDraggingImageComponent,
     NSDraggingImageComponentIconKey, NSDraggingItem, NSEventModifierFlags, NSEventType,
+    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardURLReadingFileURLsOnlyKey,
     NSPasteboardWriting, NSRequestUserAttentionType, NSScreen, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSWindow, NSWindowAnimationBehavior,
@@ -50,8 +46,8 @@ use objc2_app_kit::{
 };
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{
-    NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect,
-    NSSize, NSString, NSUInteger, NSURL,
+    NSArray, NSDictionary, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo,
+    NSRect, NSSize, NSString, NSUInteger, NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use parking_lot::Mutex;
@@ -3832,30 +3828,54 @@ fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPa
     external_paths_from_pasteboard(pasteboard)
 }
 
-/// The drag's paths from its board. An ordinary file drag carries its property-list paths
-/// and decodes as before. A board with no paths is admitted only when it is a genuine
-/// file promise (NSFilePromiseReceiver can read it), as an empty path list: the drop's
-/// original is received during Submit, where the app has the board. Any other board, such
-/// as a web URL or text, is not admitted.
-#[expect(
-    deprecated,
-    reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
-)]
+/// The drag's paths from its board: every file URL the board carries, read with the
+/// file-URL-only option, so web URLs and promise-only representations are not paths. A
+/// board with no file URL is admitted only when it is a genuine file promise
+/// (NSFilePromiseReceiver can read it), as an empty path list: the drop's original is
+/// received during Submit, where the app has the board. Any other board, such as a web URL
+/// or text, is not admitted, and neither is one whose file URL cannot be converted to a path.
 fn external_paths_from_pasteboard(pasteboard: *mut AnyObject) -> Option<ExternalPaths> {
-    let mut paths = SmallVec::new();
-    let filenames: *mut NSArray<NSString> =
-        unsafe { msg_send![pasteboard, propertyListForType: NSFilenamesPboardType] };
-    let Some(filenames) = (unsafe { filenames.as_ref() }) else {
+    let paths = file_url_paths(pasteboard)?;
+    if paths.is_empty() {
         return board_has_file_promise(pasteboard).then(ExternalPaths::default);
-    };
-    for file in filenames {
-        let path = unsafe {
-            let f = file.UTF8String();
-            CStr::from_ptr(f).to_string_lossy().into_owned()
-        };
-        paths.push(PathBuf::from(path))
     }
-    Some(ExternalPaths(paths))
+    Some(ExternalPaths(SmallVec::from_vec(paths)))
+}
+
+/// The board's file URLs as filesystem paths, from the NSURL objects AppKit returns. Each
+/// path copies the URL's native filesystem representation without lossy string conversion
+/// or a second URL decode, preserving literal `%2F` and `%20` text. Foundation normalizes
+/// Unicode; URLs whose bytes AppKit cannot reconstruct are rejected below. A board with
+/// no file URL yields an empty list.
+///
+/// Failure policy: when any file URL cannot be converted (for example a path beyond the
+/// system path limit), this returns `None` for the whole board. Returning the remaining
+/// paths would admit a subset of the drop without telling the user, so the drop is rejected.
+fn file_url_paths(pasteboard: *mut AnyObject) -> Option<Vec<PathBuf>> {
+    if pasteboard.is_null() {
+        return None;
+    }
+    // SAFETY: AppKit's drag board is an NSPasteboard, and the null case returned above.
+    // The reference is used only for the synchronous read below, while the board is live.
+    let pasteboard = unsafe { &*pasteboard.cast::<NSPasteboard>() };
+    let classes = NSArray::<AnyClass>::from_slice(&[class!(NSURL)]);
+    // SAFETY: `numberWithBool:` is NSNumber's class factory and returns a valid autoreleased object.
+    let number: Retained<AnyObject> =
+        unsafe { msg_send![class!(NSNumber), numberWithBool: Bool::YES] };
+    // SAFETY: AppKit's exported option key is valid while the framework is loaded.
+    let file_urls_only = unsafe { NSPasteboardURLReadingFileURLsOnlyKey };
+    let options = NSDictionary::<NSString, AnyObject>::from_slices(&[file_urls_only], &[&*number]);
+    // SAFETY: the board is live on this thread for the call; the class array and options are
+    // valid arguments, and the returned array is retained by the `Option<Retained<_>>`.
+    let Some(found) =
+        (unsafe { pasteboard.readObjectsForClasses_options(&classes, Some(&options)) })
+    else {
+        return Some(Vec::new());
+    };
+    found
+        .iter()
+        .map(|object| object.downcast_ref::<NSURL>()?.to_file_path())
+        .collect()
 }
 
 /// Whether the board holds a file promise that NSFilePromiseReceiver can read. A web URL
@@ -3876,18 +3896,14 @@ fn board_has_file_promise(pasteboard: *mut AnyObject) -> bool {
     }
 }
 
-/// The types the window registers for: the property-list paths Snafu has always taken,
-/// plus the promised-file types NSFilePromiseReceiver reads, so a promise-only drag such
-/// as Safari's image drag reaches the drag destination. Registration adds types only;
-/// ordinary file drags keep the same path type.
-#[expect(
-    deprecated,
-    reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
-)]
+/// The types the window registers for: file URLs (`public.file-url`), which path drags carry,
+/// plus the promised-file types NSFilePromiseReceiver reads, so a promise-only drag such as
+/// Safari's image drag reaches the drag destination.
 fn dragged_types() -> Retained<NSArray<NSString>> {
     let readable: Option<Retained<NSArray<NSString>>> = AnyClass::get(c"NSFilePromiseReceiver")
         .map(|receiver| unsafe { msg_send![receiver, readableDraggedTypes] });
-    let mut types = vec![unsafe { NSFilenamesPboardType }.retain()];
+    // SAFETY: AppKit's exported pasteboard-type constant is valid while the framework is loaded.
+    let mut types = vec![unsafe { NSPasteboardTypeFileURL }.retain()];
     if let Some(readable) = &readable {
         for kind in readable.iter() {
             if !types.contains(&kind) {
@@ -4272,43 +4288,211 @@ mod tests {
         unsafe { msg_send![*class, new] }
     }
 
-    /// Put one file-promise provider of `file_type` on the board, as Safari's image drag does.
-    fn write_promise(board: &AnyObject, file_type: &str) {
+    /// One file-promise provider of `file_type`, as a drag source writes it. The test never
+    /// asks it to write the promise.
+    fn promise_object(file_type: &str) -> Retained<AnyObject> {
         let file_type = NSString::from_str(file_type);
         let delegate = promise_delegate();
-        let provider: Retained<AnyObject> = unsafe {
+        // SAFETY: the provider class implements the delegate selectors AppKit requires.
+        unsafe {
             let allocated: objc2::rc::Allocated<AnyObject> =
                 msg_send![class!(NSFilePromiseProvider), alloc];
             msg_send![allocated, initWithFileType: &*file_type, delegate: &*delegate]
-        };
-        let objects = NSArray::<AnyObject>::from_retained_slice(&[provider]);
-        let wrote: bool = unsafe { msg_send![board, writeObjects: &*objects] };
-        assert!(wrote, "the test board took the promise");
+        }
     }
 
+    /// Put one file-promise provider of `file_type` on the board, as Safari's image drag does.
+    fn write_promise(board: &AnyObject, file_type: &str) {
+        write_objects(board, &[promise_object(file_type)]);
+    }
+
+    /// Write `objects` to the board in one `writeObjects:` call, as a drag source does.
+    fn write_objects(board: &AnyObject, objects: &[Retained<AnyObject>]) {
+        let objects = NSArray::<AnyObject>::from_retained_slice(objects);
+        // SAFETY: the board and the objects are live, and each object is a pasteboard writer.
+        let wrote: bool = unsafe { msg_send![board, writeObjects: &*objects] };
+        assert!(wrote, "the test board took the objects");
+    }
+
+    /// The file URL a drag source writes for `bytes`, built from the raw file-system name so
+    /// non-UTF-8 bytes reach Foundation unchanged.
+    fn file_url_object(bytes: &[u8]) -> Retained<AnyObject> {
+        let c_name = CString::new(bytes).expect("a path without an interior nul");
+        let name = NonNull::new(c_name.as_ptr().cast_mut()).expect("a non-null C string");
+        // SAFETY: `name` points at a nul-terminated copy that `c_name` keeps alive for the call.
+        let url = unsafe {
+            NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(name, false, None)
+        };
+        // SAFETY: an NSURL is an Objective-C object, so the same reference is valid as an AnyObject.
+        unsafe { Retained::cast_unchecked(url) }
+    }
+
+    /// A web URL object, as a drag from a web page writes it.
+    fn web_url_object(text: &str) -> Retained<AnyObject> {
+        let url = NSURL::URLWithString(&NSString::from_str(text)).expect("a web URL");
+        // SAFETY: an NSURL is an Objective-C object, so the same reference is valid as an AnyObject.
+        unsafe { Retained::cast_unchecked(url) }
+    }
+
+    /// A board holding one explicit `public.file-url` string, with no NSURL object beside it,
+    /// is matched by the registered types and decoded to its path.
     #[test]
-    fn an_ordinary_path_board_decodes_its_paths() {
+    fn an_explicit_file_url_item_is_matched_and_decoded() {
         autoreleasepool(|_| {
             let board = private_board();
-            let path = NSString::from_str("/tmp/snafu-admission/dropped.png");
-            let paths = NSArray::<NSString>::from_slice(&[&*path]);
-            let _: isize = unsafe { msg_send![&*board, clearContents] };
-            #[expect(deprecated, reason = "the test writes the path-list type Snafu reads")]
-            let types = NSArray::<NSString>::from_slice(&[unsafe { NSFilenamesPboardType }]);
+            let path = "/tmp/snafu-admission/explicit name.png";
+            let url = file_url_object(path.as_bytes());
+            // SAFETY: `absoluteString` is a getter on a live NSURL.
+            let absolute: Option<Retained<NSString>> = unsafe { msg_send![&*url, absoluteString] };
+            let absolute = absolute.expect("a file URL has an absolute string");
+            // SAFETY: AppKit's exported pasteboard-type constant is valid while the framework is loaded.
+            let types = NSArray::<NSString>::from_slice(&[unsafe { NSPasteboardTypeFileURL }]);
+            // SAFETY: the board is a live pasteboard and the type array holds live NSString types.
             let _: isize = unsafe {
-                msg_send![&*board, declareTypes: &*types, owner: std::ptr::null::<AnyObject>()]
+                msg_send![&*board, declareTypes: &*types, owner: ptr::null::<AnyObject>()]
             };
-            #[expect(deprecated, reason = "the test writes the path-list type Snafu reads")]
+            // SAFETY: the board is live and the string and type are live NSStrings.
             let wrote: bool = unsafe {
-                msg_send![&*board, setPropertyList: &*paths, forType: NSFilenamesPboardType]
+                msg_send![&*board, setString: &*absolute, forType: NSPasteboardTypeFileURL]
             };
-            assert!(wrote);
-            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
-                .expect("a path board is admitted");
-            assert_eq!(
-                decoded.paths(),
-                [PathBuf::from("/tmp/snafu-admission/dropped.png")]
+            assert!(wrote, "the test board took the file URL string");
+            // SAFETY: the board is live and the registered types are a live NSArray of NSString.
+            let available: *mut NSString =
+                unsafe { msg_send![&*board, availableTypeFromArray: &*dragged_types()] };
+            assert!(
+                !available.is_null(),
+                "the window registers the file-URL type"
             );
+            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                .expect("a file URL board is admitted");
+            assert_eq!(decoded.paths(), [PathBuf::from(path)]);
+            release(&board);
+        });
+    }
+
+    /// Foundation normalizes Unicode to the filesystem form. Spaces and literal escape-looking
+    /// text must survive without a second URL decode in the drop handler.
+    #[test]
+    fn escaped_and_unicode_file_names_round_trip_exactly() {
+        autoreleasepool(|_| {
+            for name in [
+                "dropped cafe\u{301} 100%.png",
+                "two words.png",
+                "literal%2F%20image.png",
+                "日本語 image.png",
+            ] {
+                let board = private_board();
+                let path = format!("/tmp/snafu-admission/{name}");
+                write_objects(&board, &[file_url_object(path.as_bytes())]);
+                let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                    .expect("a file URL board is admitted");
+                assert_eq!(decoded.paths(), [PathBuf::from(path.as_str())], "{name}");
+                release(&board);
+            }
+        });
+    }
+
+    /// A raw filesystem URL can contain non-UTF-8 bytes, but AppKit cannot reconstruct its
+    /// filesystem representation after pasteboard serialization. Reject it without substituting
+    /// replacement characters or admitting the other file as a partial drop.
+    #[test]
+    fn an_unreadable_non_utf8_url_rejects_the_whole_board() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let bytes: &[u8] = b"/tmp/snafu-admission/caf\xE9-\xFF.png";
+            write_objects(
+                &board,
+                &[
+                    file_url_object(b"/tmp/snafu-admission/ordinary.png"),
+                    file_url_object(bytes),
+                ],
+            );
+            assert!(external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut()).is_none());
+            release(&board);
+        });
+    }
+
+    /// Several file URLs on one board are all retained.
+    #[test]
+    fn multiple_file_urls_are_all_retained() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let first = "/tmp/snafu-admission/first.png";
+            let second = "/tmp/snafu-admission/second.png";
+            write_objects(
+                &board,
+                &[
+                    file_url_object(first.as_bytes()),
+                    file_url_object(second.as_bytes()),
+                ],
+            );
+            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                .expect("a multi-file board is admitted");
+            let mut paths = decoded.paths().to_vec();
+            paths.sort();
+            assert_eq!(paths, [PathBuf::from(first), PathBuf::from(second)]);
+            release(&board);
+        });
+    }
+
+    /// A file and a web URL on one board admit only the file: the file-URL-only read never
+    /// returns the web item as a path.
+    #[test]
+    fn a_file_and_a_web_url_admit_only_the_file() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let path = "/tmp/snafu-admission/selected.png";
+            write_objects(
+                &board,
+                &[
+                    file_url_object(path.as_bytes()),
+                    web_url_object("https://example.com/picture.png"),
+                ],
+            );
+            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                .expect("the file is admitted");
+            assert_eq!(decoded.paths(), [PathBuf::from(path)]);
+            release(&board);
+        });
+    }
+
+    /// A file preview beside a promise keeps its path: the file URL is admitted as it is,
+    /// and the promise adds no path of its own.
+    #[test]
+    fn a_file_preview_beside_a_promise_keeps_its_path() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let path = "/tmp/snafu-admission/preview.png";
+            write_objects(
+                &board,
+                &[
+                    file_url_object(path.as_bytes()),
+                    promise_object("public.png"),
+                ],
+            );
+            let decoded = external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut())
+                .expect("the preview's file is admitted");
+            assert_eq!(decoded.paths(), [PathBuf::from(path)]);
+            release(&board);
+        });
+    }
+
+    /// A file URL that cannot be converted to a path rejects the whole board: the other file
+    /// is not admitted alone, so the drop is never a silent subset.
+    #[test]
+    fn an_unconvertible_file_url_rejects_the_whole_board() {
+        autoreleasepool(|_| {
+            let board = private_board();
+            let short = "/tmp/snafu-admission/short.png";
+            let long = format!("/tmp/snafu-admission/{}.png", "x".repeat(1100));
+            write_objects(
+                &board,
+                &[
+                    file_url_object(short.as_bytes()),
+                    file_url_object(long.as_bytes()),
+                ],
+            );
+            assert!(external_paths_from_pasteboard(Retained::as_ptr(&board).cast_mut()).is_none());
             release(&board);
         });
     }
