@@ -152,6 +152,7 @@ impl TestPlatform {
         Self::with_platform(executor, foreground_executor, text_system, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_display_added(
         &self,
         display_id: DisplayId,
@@ -163,6 +164,7 @@ impl TestPlatform {
 
     /// Adds a display without telling App yet, as when the platform's
     /// notifications about a window arrive before those about displays.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn connect_display(
         &self,
         display_id: DisplayId,
@@ -173,6 +175,7 @@ impl TestPlatform {
         self.displays.borrow_mut().push(display);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_display_removed(&self, display_id: DisplayId) {
         self.displays
             .borrow_mut()
@@ -180,6 +183,7 @@ impl TestPlatform {
         self.report_displays_changed();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_display_refresh_interval_change(
         &self,
         display_id: DisplayId,
@@ -193,6 +197,7 @@ impl TestPlatform {
         self.report_displays_changed();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn report_displays_changed(&self) {
         let callback = self.displays_changed_callback.borrow_mut().take();
         if let Some(mut callback) = callback {
